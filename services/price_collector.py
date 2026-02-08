@@ -53,6 +53,32 @@ def _insert_prices(conn, stock_id, prices, after_date=None):
     return count
 
 
+def _extract_ticker_df(data, ticker, tickers):
+    """yfinance DataFrame에서 개별 종목 데이터 추출 (버전 호환)"""
+    import pandas as pd
+
+    if len(tickers) == 1:
+        return data
+
+    if not isinstance(data.columns, pd.MultiIndex):
+        return None
+
+    # yfinance 버전에 따라 MultiIndex 레벨 순서가 다름
+    # 구버전: (Ticker, Price), 신버전: (Price, Ticker)
+    level0 = set(data.columns.get_level_values(0))
+    price_cols = {"Open", "High", "Low", "Close", "Volume", "Adj Close"}
+
+    if ticker in level0:
+        # Level 0 = Ticker (구버전 구조)
+        return data[ticker]
+    elif level0 & price_cols:
+        # Level 0 = Price 컬럼 → Ticker는 Level 1 (신버전 구조)
+        level1 = set(data.columns.get_level_values(1))
+        if ticker in level1:
+            return data.xs(ticker, level=1, axis=1)
+    return None
+
+
 def collect_prices_yfinance(conn, start_date=None, batch_size=200, backfill=False):
     """yfinance로 전 종목 주가 수집 (초기 대량 수집용)"""
     try:
@@ -68,6 +94,7 @@ def collect_prices_yfinance(conn, start_date=None, batch_size=200, backfill=Fals
 
     total_candles = 0
     total = len(stocks)
+    error_count = 0
 
     # 배치 단위로 다운로드
     for batch_start in range(0, total, batch_size):
@@ -95,18 +122,31 @@ def collect_prices_yfinance(conn, start_date=None, batch_size=200, backfill=Fals
             print(f"  배치 {batch_num} 다운로드 실패: {e}")
             continue
 
+        if data.empty:
+            print(f"  배치 {batch_num} 빈 데이터 (Yahoo Finance 응답 없음)")
+            continue
+
+        # 첫 배치에서 컬럼 구조 출력 (디버깅용)
+        if batch_num == 1:
+            import pandas as pd
+            if isinstance(data.columns, pd.MultiIndex):
+                lvl0_sample = list(set(data.columns.get_level_values(0)))[:5]
+                print(f"  [INFO] 컬럼 구조: MultiIndex, level0={lvl0_sample}")
+            else:
+                print(f"  [INFO] 컬럼 구조: {list(data.columns[:5])}")
+
+        batch_candles = 0
+        batch_skipped = 0
         for s in batch:
             ticker = s["ticker"]
             stock_id = s["id"]
             latest = None if backfill else _get_latest_date(conn, stock_id)
 
             try:
-                if len(tickers) == 1:
-                    df = data
-                else:
-                    if ticker not in data.columns.get_level_values(0):
-                        continue
-                    df = data[ticker]
+                df = _extract_ticker_df(data, ticker, tickers)
+                if df is None:
+                    batch_skipped += 1
+                    continue
 
                 df = df.dropna(subset=["Close"])
                 if df.empty:
@@ -125,13 +165,23 @@ def collect_prices_yfinance(conn, start_date=None, batch_size=200, backfill=Fals
                     })
 
                 inserted = _insert_prices(conn, stock_id, prices, after_date=latest)
-                total_candles += inserted
+                batch_candles += inserted
 
-            except Exception:
+            except Exception as e:
+                error_count += 1
+                if error_count <= 10:
+                    print(f"  [ERR] {ticker}: {e}")
                 continue
 
+        total_candles += batch_candles
         conn.commit()
-        print(f"  배치 {batch_num} 완료 (누적 {total_candles}개 캔들)")
+        msg = f"  배치 {batch_num} 완료 (배치 +{batch_candles}개, 누적 {total_candles}개 캔들)"
+        if batch_skipped > 0:
+            msg += f", {batch_skipped}개 종목 스킵"
+        print(msg)
+
+    if error_count > 10:
+        print(f"  [WARN] 총 {error_count}개 에러 발생")
 
     return total_candles
 

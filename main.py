@@ -4,7 +4,8 @@ Breakout Spotter CLI
 Usage:
     python main.py init              # asset_us DB에 bs_* 테이블 생성
     python main.py collect-symbols   # 미국 전 종목 목록 수집
-    python main.py collect-prices    # 12개월 주가 수집 (yfinance → KIS 폴백)
+    python main.py collect-prices    # 주가 수집 (yfinance → KIS 폴백)
+    python main.py collect-prices --reset  # 기존 데이터 삭제 후 재수집
     python main.py sync-themes       # theme_analyzer에서 테마 동기화
     python main.py scan              # 돌파 패턴 스캔
     python main.py full              # 위 전체 순차 실행
@@ -44,10 +45,18 @@ def run_collect_symbols():
         conn.close()
 
 
-def run_collect_prices():
+def run_collect_prices(reset=False):
     from services.price_collector import collect_prices
     from services.kis_service import KISClient
     conn = get_connection()
+    if reset:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM bs_daily_prices")
+        count = cursor.fetchone()[0]
+        print(f"[주가 초기화] bs_daily_prices 테이블 비우기 ({count:,}행 삭제)...")
+        cursor.execute("TRUNCATE TABLE bs_daily_prices")
+        conn.commit()
+        print("[주가 초기화] 완료")
     kis = KISClient()
     try:
         collect_prices(conn, kis_client=kis)
@@ -147,11 +156,12 @@ def main():
         return
 
     command = sys.argv[1]
+    flags = sys.argv[2:]
 
     commands = {
         "init": init_db,
         "collect-symbols": run_collect_symbols,
-        "collect-prices": run_collect_prices,
+        "collect-prices": lambda: run_collect_prices(reset="--reset" in flags),
         "sync-themes": run_sync_themes,
         "scan": run_scan,
         "backtest": run_backtest,
