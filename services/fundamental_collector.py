@@ -37,7 +37,7 @@ def _collect_delisted_symbols(conn, api_key):
     print("[상장폐지 종목] 수집 시작...")
 
     try:
-        data = _fmp_get("/api/v3/delisted-companies", api_key, {"limit": 10000})
+        data = _fmp_get("/stable/delisted-companies", api_key, {"page": 0, "limit": 10000})
     except Exception as e:
         print(f"  [ERR] 상장폐지 목록 조회 실패: {e}")
         return 0
@@ -91,7 +91,7 @@ def _insert_financials(conn, stock_id, records):
         if not filing_date or not period_end:
             continue
 
-        fiscal_year = rec.get("calendarYear")
+        fiscal_year = rec.get("fiscalYear") or rec.get("calendarYear")
         if not fiscal_year:
             try:
                 fiscal_year = int(period_end[:4])
@@ -100,7 +100,7 @@ def _insert_financials(conn, stock_id, records):
 
         revenue = rec.get("revenue")
         net_income = rec.get("netIncome")
-        eps = rec.get("epsdiluted")
+        eps = rec.get("epsDiluted") or rec.get("epsdiluted")
 
         try:
             cursor.execute(
@@ -130,7 +130,7 @@ def _collect_income_statements(conn, api_key, stocks):
             print(f"  진행: {i}/{total} (누적 {total_inserted}개, 에러 {error_count}개)")
 
         try:
-            data = _fmp_get(f"/api/v3/income-statement/{ticker}", api_key, {"period": "annual", "limit": 30})
+            data = _fmp_get("/stable/income-statement", api_key, {"symbol": ticker, "period": "annual", "limit": 30})
             if data and isinstance(data, list):
                 inserted = _insert_financials(conn, stock_id, data)
                 total_inserted += inserted
@@ -177,8 +177,8 @@ def _insert_earnings(conn, stock_id, records):
                    VALUES (%s, %s, %s, %s, %s, %s, %s)""",
                 (
                     stock_id, earnings_date,
-                    rec.get("epsEstimated"), rec.get("eps"),
-                    rec.get("revenueEstimated"), rec.get("revenue"),
+                    rec.get("epsEstimated"), rec.get("epsActual") or rec.get("eps"),
+                    rec.get("revenueEstimated"), rec.get("revenueActual") or rec.get("revenue"),
                     rec.get("time"),
                 ),
             )

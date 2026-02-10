@@ -298,8 +298,7 @@ def collect_prices_fmp(conn, api_key, start_date, include_delisted=False):
             trade_date = rec.get("date")
             if not trade_date:
                 continue
-            # adjClose가 있으면 사용 (split-adjusted), 없으면 close
-            close = rec.get("adjClose") or rec.get("close") or 0
+            close = rec.get("close") or 0
             prices.append({
                 "date": trade_date,
                 "open": round(float(rec.get("open") or 0), 4),
