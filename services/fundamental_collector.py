@@ -5,12 +5,13 @@ bs_financials, bs_earnings 테이블에 데이터 저장.
 """
 
 import time
+import random
 import requests
 import pymysql
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 FMP_BASE = "https://financialmodelingprep.com"
-MAX_RETRIES = 3
+MAX_RETRIES = 4
 
 
 def _get_all_stocks(conn, include_delisted=False):
@@ -118,7 +119,7 @@ def _insert_financials(conn, stock_id, records):
 
 
 def _fetch_one(endpoint, api_key, params, stock):
-    """단일 종목 HTTP 요청 (스레드용). 429시 exponential backoff 재시도."""
+    """단일 종목 HTTP 요청 (스레드용). 429시 exponential backoff + jitter 재시도."""
     for attempt in range(MAX_RETRIES + 1):
         try:
             data = _fmp_get(endpoint, api_key, params)
@@ -129,7 +130,8 @@ def _fetch_one(endpoint, api_key, params, stock):
             if e.response is not None and e.response.status_code == 404:
                 return (stock, None, None)
             if e.response is not None and e.response.status_code == 429 and attempt < MAX_RETRIES:
-                time.sleep(2 ** attempt)
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                time.sleep(wait)
                 continue
             return (stock, None, e)
         except Exception as e:
@@ -144,7 +146,7 @@ def _collect_income_statements(conn, api_key, stocks):
     total_inserted = 0
     error_count = 0
     BATCH = 50
-    WORKERS = 15
+    WORKERS = 10
 
     for batch_start in range(0, total, BATCH):
         batch = stocks[batch_start:batch_start + BATCH]
@@ -170,6 +172,7 @@ def _collect_income_statements(conn, api_key, stocks):
                     total_inserted += inserted
 
         conn.commit()
+        time.sleep(0.5)  # 배치 간 딜레이 (rate limit 방지)
 
     if error_count > 10:
         print(f"  [WARN] 총 {error_count}개 에러")
@@ -214,7 +217,7 @@ def _collect_earnings(conn, api_key, stocks):
     total_inserted = 0
     error_count = 0
     BATCH = 50
-    WORKERS = 15
+    WORKERS = 10
 
     for batch_start in range(0, total, BATCH):
         batch = stocks[batch_start:batch_start + BATCH]
@@ -239,6 +242,7 @@ def _collect_earnings(conn, api_key, stocks):
                     total_inserted += inserted
 
         conn.commit()
+        time.sleep(0.5)  # 배치 간 딜레이 (rate limit 방지)
 
     if error_count > 10:
         print(f"  [WARN] 총 {error_count}개 에러")

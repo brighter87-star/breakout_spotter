@@ -4,13 +4,14 @@ bs_daily_prices 테이블에 OHLCV 데이터 저장.
 """
 
 import time
+import random
 import pymysql
 import requests
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 FMP_BASE = "https://financialmodelingprep.com"
-MAX_RETRIES = 3
+MAX_RETRIES = 4
 
 
 def _get_all_stocks(conn, include_delisted=False):
@@ -248,7 +249,7 @@ def collect_prices_kis(conn, kis_client, target_days=260):
 
 
 def _fetch_prices_one(api_key, ticker, req_from):
-    """단일 종목 주가 HTTP 요청 (스레드용). 429시 exponential backoff 재시도."""
+    """단일 종목 주가 HTTP 요청 (스레드용). 429시 exponential backoff + jitter 재시도."""
     for attempt in range(MAX_RETRIES + 1):
         try:
             params = {"symbol": ticker, "from": req_from, "apikey": api_key}
@@ -265,7 +266,8 @@ def _fetch_prices_one(api_key, ticker, req_from):
             if e.response is not None and e.response.status_code == 404:
                 return None
             if e.response is not None and e.response.status_code == 429 and attempt < MAX_RETRIES:
-                time.sleep(2 ** attempt)
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                time.sleep(wait)
                 continue
             raise
         except Exception:
@@ -290,7 +292,7 @@ def collect_prices_fmp(conn, api_key, start_date, include_delisted=False):
     total = len(stocks)
     error_count = 0
     BATCH = 50
-    WORKERS = 15
+    WORKERS = 10
 
     for batch_start in range(0, total, BATCH):
         batch = stocks[batch_start:batch_start + BATCH]
@@ -338,6 +340,7 @@ def collect_prices_fmp(conn, api_key, start_date, include_delisted=False):
                     total_candles += inserted
 
         conn.commit()
+        time.sleep(0.5)  # 배치 간 딜레이 (rate limit 방지)
 
     if error_count > 10:
         print(f"  [WARN] 총 {error_count}개 에러")
