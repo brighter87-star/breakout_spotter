@@ -4,11 +4,13 @@ bs_financials, bs_earnings 테이블에 데이터 저장.
 상장폐지 종목 수집 지원.
 """
 
+import time
 import requests
 import pymysql
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 FMP_BASE = "https://financialmodelingprep.com"
+MAX_RETRIES = 3
 
 
 def _get_all_stocks(conn, include_delisted=False):
@@ -116,18 +118,23 @@ def _insert_financials(conn, stock_id, records):
 
 
 def _fetch_one(endpoint, api_key, params, stock):
-    """단일 종목 HTTP 요청 (스레드용). (stock, data_or_None, error_or_None) 반환"""
-    try:
-        data = _fmp_get(endpoint, api_key, params)
-        if data and isinstance(data, list):
-            return (stock, data, None)
-        return (stock, None, None)
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 404:
+    """단일 종목 HTTP 요청 (스레드용). 429시 exponential backoff 재시도."""
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            data = _fmp_get(endpoint, api_key, params)
+            if data and isinstance(data, list):
+                return (stock, data, None)
             return (stock, None, None)
-        return (stock, None, e)
-    except Exception as e:
-        return (stock, None, e)
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                return (stock, None, None)
+            if e.response is not None and e.response.status_code == 429 and attempt < MAX_RETRIES:
+                time.sleep(2 ** attempt)
+                continue
+            return (stock, None, e)
+        except Exception as e:
+            return (stock, None, e)
+    return (stock, None, None)
 
 
 def _collect_income_statements(conn, api_key, stocks):

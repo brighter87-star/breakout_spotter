@@ -3,12 +3,14 @@
 bs_daily_prices 테이블에 OHLCV 데이터 저장.
 """
 
+import time
 import pymysql
 import requests
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 FMP_BASE = "https://financialmodelingprep.com"
+MAX_RETRIES = 3
 
 
 def _get_all_stocks(conn, include_delisted=False):
@@ -246,24 +248,29 @@ def collect_prices_kis(conn, kis_client, target_days=260):
 
 
 def _fetch_prices_one(api_key, ticker, req_from):
-    """단일 종목 주가 HTTP 요청 (스레드용)"""
-    try:
-        params = {"symbol": ticker, "from": req_from, "apikey": api_key}
-        resp = requests.get(
-            f"{FMP_BASE}/stable/historical-price-eod/full",
-            params=params, timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data and isinstance(data, list):
-            return data
-        return None
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 404:
+    """단일 종목 주가 HTTP 요청 (스레드용). 429시 exponential backoff 재시도."""
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            params = {"symbol": ticker, "from": req_from, "apikey": api_key}
+            resp = requests.get(
+                f"{FMP_BASE}/stable/historical-price-eod/full",
+                params=params, timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data and isinstance(data, list):
+                return data
             return None
-        raise
-    except Exception:
-        raise
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                return None
+            if e.response is not None and e.response.status_code == 429 and attempt < MAX_RETRIES:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+        except Exception:
+            raise
+    return None
 
 
 def collect_prices_fmp(conn, api_key, start_date, include_delisted=False):
