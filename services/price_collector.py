@@ -261,8 +261,8 @@ def collect_prices_fmp(conn, api_key, start_date, include_delisted=False):
         stock_id = s["id"]
         latest = _get_latest_date(conn, stock_id)
 
-        if i % 200 == 0:
-            print(f"  진행: {i}/{total} (누적 {total_candles}개 캔들, 에러 {error_count}개)")
+        if i % 50 == 0:
+            print(f"  진행: {i}/{total} (누적 {total_candles}개 캔들, 에러 {error_count}개)", flush=True)
 
         # 시작일 결정: 기존 데이터가 있으면 그 이후부터
         req_from = str(latest) if latest and str(latest) > start_date else start_date

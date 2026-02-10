@@ -126,8 +126,8 @@ def _collect_income_statements(conn, api_key, stocks):
         ticker = s["ticker"]
         stock_id = s["id"]
 
-        if i % 200 == 0:
-            print(f"  진행: {i}/{total} (누적 {total_inserted}개, 에러 {error_count}개)")
+        if i % 50 == 0:
+            print(f"  진행: {i}/{total} (누적 {total_inserted}개, 에러 {error_count}개)", flush=True)
 
         try:
             data = _fmp_get("/stable/income-statement", api_key, {"symbol": ticker, "period": "annual", "limit": 30})
@@ -199,11 +199,11 @@ def _collect_earnings(conn, api_key, stocks):
         ticker = s["ticker"]
         stock_id = s["id"]
 
-        if i % 200 == 0:
-            print(f"  진행: {i}/{total} (누적 {total_inserted}개, 에러 {error_count}개)")
+        if i % 50 == 0:
+            print(f"  진행: {i}/{total} (누적 {total_inserted}개, 에러 {error_count}개)", flush=True)
 
         try:
-            data = _fmp_get(f"/stable/earnings", api_key, {"symbol": ticker, "limit": 100})
+            data = _fmp_get("/stable/earnings", api_key, {"symbol": ticker, "limit": 100})
             if data and isinstance(data, list):
                 inserted = _insert_earnings(conn, stock_id, data)
                 total_inserted += inserted
