@@ -7,7 +7,9 @@ CREATE TABLE IF NOT EXISTS bs_stocks (
     name          VARCHAR(200),
     exchange      VARCHAR(10) COMMENT 'NASDAQ, NYSE, AMEX',
     exchange_code VARCHAR(4)  COMMENT 'NAS, NYS, AMS',
+    market_cap    BIGINT,
     is_active     TINYINT(1) DEFAULT 1,
+    delisted_date DATE DEFAULT NULL,
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uk_ticker (ticker),
     INDEX idx_exchange (exchange_code)
@@ -46,6 +48,36 @@ CREATE TABLE IF NOT EXISTS bs_stock_themes (
     FOREIGN KEY (theme_id) REFERENCES bs_themes(id),
     UNIQUE KEY uk_mapping (stock_id, theme_id, report_date),
     INDEX idx_theme_date (theme_id, report_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS bs_financials (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    stock_id        INT NOT NULL,
+    fiscal_year     SMALLINT NOT NULL,
+    period_end      DATE NOT NULL,
+    filing_date     DATE NOT NULL,
+    revenue         BIGINT,
+    net_income      BIGINT,
+    eps_diluted     DECIMAL(10,4),
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (stock_id) REFERENCES bs_stocks(id),
+    UNIQUE KEY uk_stock_fy (stock_id, fiscal_year),
+    INDEX idx_stock_filing (stock_id, filing_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS bs_earnings (
+    id                INT AUTO_INCREMENT PRIMARY KEY,
+    stock_id          INT NOT NULL,
+    earnings_date     DATE NOT NULL,
+    eps_estimated     DECIMAL(10,4),
+    eps_actual        DECIMAL(10,4),
+    revenue_estimated BIGINT,
+    revenue_actual    BIGINT,
+    time_of_day       VARCHAR(3) COMMENT 'bmo=장전, amc=장후',
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (stock_id) REFERENCES bs_stocks(id),
+    UNIQUE KEY uk_stock_earnings (stock_id, earnings_date),
+    INDEX idx_earnings_date (earnings_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS bs_breakout_signals (

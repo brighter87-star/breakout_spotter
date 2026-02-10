@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     DB_PASSWORD: str
     DB_NAME: str = "asset_us"
 
+    # FMP API
+    FMP_API_KEY: str = ""
+
     # theme_analyzer SQLite 경로
     THEME_DB_PATH: str = "c:/theme_analyzer/data/theme_analyzer.db"
 
@@ -32,7 +35,11 @@ class Settings(BaseSettings):
     CONSOLIDATION_MAX_RANGE_PCT: float = 10.0
     VOLUME_RATIO_MIN: float = 2.0
     VOLUME_RATIO_DAYS: int = 10
-    LOOKBACK_MONTHS: int = 74
+    LOOKBACK_MONTHS: int = 120
+
+    # 실적 필터
+    FUNDAMENTAL_FILTER: bool = True
+    FUNDAMENTAL_GROWTH_YEARS: int = 1
 
     model_config = {
         "env_file": str(BASE_DIR / ".env"),

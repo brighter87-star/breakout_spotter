@@ -42,10 +42,13 @@ def load_all_prices(conn):
     return dict(prices)
 
 
-def load_stock_info(conn):
+def load_stock_info(conn, include_delisted=False):
     """종목 정보 로드. {stock_id: {ticker, sector, exchange_code, market_cap}}"""
     cursor = conn.cursor(pymysql.cursors.DictCursor)
-    cursor.execute("SELECT id, ticker, sector, exchange_code, market_cap FROM bs_stocks WHERE is_active = 1")
+    if include_delisted:
+        cursor.execute("SELECT id, ticker, sector, exchange_code, market_cap FROM bs_stocks")
+    else:
+        cursor.execute("SELECT id, ticker, sector, exchange_code, market_cap FROM bs_stocks WHERE is_active = 1")
     return {row["id"]: row for row in cursor.fetchall()}
 
 
@@ -69,14 +72,58 @@ def load_spy_prices(conn):
     return {str(row[0]): float(row[1]) for row in cursor.fetchall()}
 
 
-def run_backtest(conn):
+def load_all_financials(conn):
+    """연간 재무 데이터 메모리 로드. {stock_id: [(fiscal_year, filing_date_str, revenue, net_income), ...]}"""
+    cursor = conn.cursor()
+    cursor.execute(
+        """SELECT stock_id, fiscal_year, filing_date, revenue, net_income
+           FROM bs_financials
+           WHERE revenue IS NOT NULL AND net_income IS NOT NULL
+           ORDER BY stock_id, fiscal_year ASC"""
+    )
+    financials = defaultdict(list)
+    for row in cursor.fetchall():
+        financials[row[0]].append((
+            int(row[1]), str(row[2]), int(row[3]), int(row[4]),
+        ))
+    return dict(financials)
+
+
+def check_fundamental(financials_list, signal_date, growth_years=1):
+    """
+    매수 시점에 공개된(filing_date <= signal_date) 실적으로 검증:
+    - growth_years년 연속 매출 성장
+    - 최근 연도 흑자 (net_income > 0)
+    """
+    available = [f for f in financials_list if f[1] <= signal_date]
+    if len(available) < growth_years + 1:
+        return False
+    recent = available[-(growth_years + 1):]
+    for i in range(1, len(recent)):
+        if recent[i][2] <= recent[i - 1][2]:
+            return False
+    if recent[-1][3] <= 0:
+        return False
+    return True
+
+
+def run_backtest(conn, include_delisted=False):
     settings = Settings()
 
     print("[backtest] loading data...")
     all_prices = load_all_prices(conn)
-    stock_info = load_stock_info(conn)
+    stock_info = load_stock_info(conn, include_delisted=include_delisted)
     sector_db = load_sectors_from_db(conn)
     spy_prices = load_spy_prices(conn)
+
+    # 실적 필터 데이터 로드
+    all_financials = {}
+    if settings.FUNDAMENTAL_FILTER:
+        all_financials = load_all_financials(conn)
+        fin_eligible = sum(1 for sid in all_financials if len(all_financials[sid]) >= 2)
+        print(f"  fundamentals: {len(all_financials)} stocks, {fin_eligible} with 2+ years")
+    if include_delisted:
+        print(f"  survivorship bias: OFF (delisted stocks included)")
 
     # 거래일 목록 + 날짜→종목 역인덱스
     all_dates = set()
@@ -189,6 +236,13 @@ def run_backtest(conn):
             score = score_breakout(breakout)
 
             mcap = info.get("market_cap")
+
+            # 실적 필터: 매출 성장 + 흑자 확인 (point-in-time)
+            if settings.FUNDAMENTAL_FILTER and all_financials:
+                fin = all_financials.get(sid)
+                if not fin or not check_fundamental(fin, current_date, settings.FUNDAMENTAL_GROWTH_YEARS):
+                    continue
+
             day_signals.append({
                 "stock_id": sid,
                 "ticker": ticker,

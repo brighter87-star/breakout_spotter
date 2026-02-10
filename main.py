@@ -4,10 +4,14 @@ Breakout Spotter CLI
 Usage:
     python main.py init              # asset_us DB에 bs_* 테이블 생성
     python main.py collect-symbols   # 미국 전 종목 목록 수집
-    python main.py collect-prices    # 주가 수집 (yfinance → KIS 폴백)
+    python main.py collect-prices    # 주가 수집 (FMP → yfinance → KIS 폴백)
     python main.py collect-prices --reset  # 기존 데이터 삭제 후 재수집
+    python main.py collect-financials      # 재무 데이터 수집 (FMP)
+    python main.py collect-financials --include-delisted  # 상장폐지 종목 포함
     python main.py sync-themes       # theme_analyzer에서 테마 동기화
     python main.py scan              # 돌파 패턴 스캔
+    python main.py backtest          # 백테스트
+    python main.py backtest --include-delisted  # 생존편향 제거 백테스트
     python main.py full              # 위 전체 순차 실행
     python main.py status            # DB 현황 조회
 """
@@ -64,6 +68,15 @@ def run_collect_prices(reset=False):
         conn.close()
 
 
+def run_collect_financials(include_delisted=False):
+    from services.fundamental_collector import collect_financials
+    conn = get_connection()
+    try:
+        collect_financials(conn, include_delisted=include_delisted)
+    finally:
+        conn.close()
+
+
 def run_sync_themes():
     from services.theme_loader import sync_themes
     conn = get_connection()
@@ -82,11 +95,11 @@ def run_scan():
         conn.close()
 
 
-def run_backtest():
+def run_backtest_cmd(include_delisted=False):
     from services.backtester import run_backtest
     conn = get_connection()
     try:
-        run_backtest(conn)
+        run_backtest(conn, include_delisted=include_delisted)
     finally:
         conn.close()
 
@@ -99,6 +112,8 @@ def show_status():
     tables = [
         ("bs_stocks", "종목"),
         ("bs_daily_prices", "일봉"),
+        ("bs_financials", "재무"),
+        ("bs_earnings", "어닝"),
         ("bs_themes", "테마"),
         ("bs_stock_themes", "테마-종목 매핑"),
         ("bs_breakout_signals", "돌파 신호"),
@@ -116,6 +131,16 @@ def show_status():
         except Exception:
             print(f"{table:<25} {desc:<15} {'(없음)':>10}")
 
+    # 종목 활성/폐지 현황
+    try:
+        cursor.execute("SELECT COUNT(*) FROM bs_stocks WHERE is_active = 1")
+        active = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM bs_stocks WHERE is_active = 0")
+        delisted = cursor.fetchone()[0]
+        print(f"\n  종목: 활성 {active:,}개, 상장폐지 {delisted:,}개")
+    except Exception:
+        pass
+
     # 주가 데이터 커버리지
     try:
         cursor.execute(
@@ -126,7 +151,7 @@ def show_status():
         )
         row = cursor.fetchone()
         if row and row[0]:
-            print(f"\n  주가 데이터: {row[0]:,}종목, {row[1]} ~ {row[2]}")
+            print(f"  주가 데이터: {row[0]:,}종목, {row[1]} ~ {row[2]}")
     except Exception:
         pass
 
@@ -162,12 +187,14 @@ def main():
         "init": init_db,
         "collect-symbols": run_collect_symbols,
         "collect-prices": lambda: run_collect_prices(reset="--reset" in flags),
+        "collect-financials": lambda: run_collect_financials(include_delisted="--include-delisted" in flags),
         "sync-themes": run_sync_themes,
         "scan": run_scan,
-        "backtest": run_backtest,
+        "backtest": lambda: run_backtest_cmd(include_delisted="--include-delisted" in flags),
         "status": show_status,
         "full": lambda: (
             run_collect_symbols(),
+            run_collect_financials(),
             run_collect_prices(),
             run_sync_themes(),
             run_scan(),

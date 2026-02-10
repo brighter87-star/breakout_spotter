@@ -1,18 +1,25 @@
 """
-주가 데이터 수집 (yfinance 1차, KIS API 2차).
-bs_daily_prices 테이블에 12개월+ OHLCV 데이터 저장.
+주가 데이터 수집 (FMP 1차, yfinance 2차, KIS API 3차).
+bs_daily_prices 테이블에 OHLCV 데이터 저장.
 """
 
+import time
 import pymysql
+import requests
 from datetime import datetime, timedelta
 
+FMP_BASE = "https://financialmodelingprep.com"
 
-def _get_all_stocks(conn):
-    """활성 종목 목록 조회"""
+
+def _get_all_stocks(conn, include_delisted=False):
+    """종목 목록 조회"""
     cursor = conn.cursor(pymysql.cursors.DictCursor)
-    cursor.execute(
-        "SELECT id, ticker, exchange_code FROM bs_stocks WHERE is_active = 1 ORDER BY id"
-    )
+    if include_delisted:
+        cursor.execute("SELECT id, ticker, exchange_code FROM bs_stocks ORDER BY id")
+    else:
+        cursor.execute(
+            "SELECT id, ticker, exchange_code FROM bs_stocks WHERE is_active = 1 ORDER BY id"
+        )
     return cursor.fetchall()
 
 
@@ -238,8 +245,87 @@ def collect_prices_kis(conn, kis_client, target_days=260):
     return total_candles
 
 
+def collect_prices_fmp(conn, api_key, start_date, include_delisted=False):
+    """FMP API로 전 종목 주가 수집 (split-adjusted)"""
+    stocks = _get_all_stocks(conn, include_delisted=include_delisted)
+    if not stocks:
+        print("  bs_stocks에 종목이 없습니다.")
+        return 0
+
+    total_candles = 0
+    total = len(stocks)
+    error_count = 0
+
+    for i, s in enumerate(stocks):
+        ticker = s["ticker"]
+        stock_id = s["id"]
+        latest = _get_latest_date(conn, stock_id)
+
+        if i % 200 == 0:
+            print(f"  진행: {i}/{total} (누적 {total_candles}개 캔들, 에러 {error_count}개)")
+
+        # 시작일 결정: 기존 데이터가 있으면 그 이후부터
+        req_from = str(latest) if latest and str(latest) > start_date else start_date
+
+        try:
+            params = {"symbol": ticker, "from": req_from}
+            params["apikey"] = api_key
+            resp = requests.get(
+                f"{FMP_BASE}/stable/historical-price-eod/full",
+                params=params, timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                pass
+            else:
+                error_count += 1
+                if error_count <= 10:
+                    print(f"  [ERR] {ticker}: {e}")
+            continue
+        except Exception as e:
+            error_count += 1
+            if error_count <= 10:
+                print(f"  [ERR] {ticker}: {e}")
+            continue
+
+        if not data or not isinstance(data, list):
+            continue
+
+        prices = []
+        for rec in data:
+            trade_date = rec.get("date")
+            if not trade_date:
+                continue
+            # adjClose가 있으면 사용 (split-adjusted), 없으면 close
+            close = rec.get("adjClose") or rec.get("close") or 0
+            prices.append({
+                "date": trade_date,
+                "open": round(float(rec.get("open") or 0), 4),
+                "high": round(float(rec.get("high") or 0), 4),
+                "low": round(float(rec.get("low") or 0), 4),
+                "close": round(float(close), 4),
+                "volume": int(rec.get("volume") or 0),
+            })
+
+        if prices:
+            inserted = _insert_prices(conn, stock_id, prices, after_date=latest)
+            total_candles += inserted
+
+        if i % 50 == 0:
+            conn.commit()
+
+        time.sleep(0.08)
+
+    conn.commit()
+    if error_count > 10:
+        print(f"  [WARN] 총 {error_count}개 에러")
+    return total_candles
+
+
 def collect_prices(conn, kis_client=None):
-    """주가 수집 메인 함수: yfinance 시도 → KIS API 폴백"""
+    """주가 수집 메인 함수: FMP → yfinance → KIS API 폴백"""
     from config.settings import Settings
     settings = Settings()
 
@@ -249,22 +335,34 @@ def collect_prices(conn, kis_client=None):
     start_date = (datetime.now() - timedelta(days=settings.LOOKBACK_MONTHS * 30)).strftime("%Y-%m-%d")
     print(f"[주가 수집] 기간: {start_date} ~ 현재 ({settings.LOOKBACK_MONTHS}개월)")
 
-    # 1차: yfinance
-    print("[주가 수집] yfinance로 수집 시도...")
-    backfill = settings.LOOKBACK_MONTHS > 12
-    batch_size = 50 if backfill else 200
-    candles = collect_prices_yfinance(conn, start_date=start_date, backfill=backfill, batch_size=batch_size)
+    candles = 0
 
-    if candles > 0:
-        print(f"[주가 수집] yfinance 완료: {candles}개 캔들 저장")
-    else:
-        # 2차: KIS API 폴백
-        if kis_client:
-            print("[주가 수집] yfinance 실패, KIS API로 폴백...")
-            candles = collect_prices_kis(conn, kis_client, target_days=260)
-            print(f"[주가 수집] KIS API 완료: {candles}개 캔들 저장")
-        else:
-            print("[주가 수집] 데이터를 수집하지 못했습니다.")
+    # 1차: FMP (split-adjusted)
+    if settings.FMP_API_KEY:
+        print("[주가 수집] FMP API로 수집 (split-adjusted)...")
+        candles = collect_prices_fmp(
+            conn, settings.FMP_API_KEY, start_date, include_delisted=True
+        )
+        if candles > 0:
+            print(f"[주가 수집] FMP 완료: {candles}개 캔들 저장")
+
+    # 2차: yfinance 폴백
+    if candles == 0:
+        print("[주가 수집] yfinance로 수집 시도...")
+        backfill = settings.LOOKBACK_MONTHS > 12
+        batch_size = 50 if backfill else 200
+        candles = collect_prices_yfinance(conn, start_date=start_date, backfill=backfill, batch_size=batch_size)
+        if candles > 0:
+            print(f"[주가 수집] yfinance 완료: {candles}개 캔들 저장")
+
+    # 3차: KIS API 폴백
+    if candles == 0 and kis_client:
+        print("[주가 수집] KIS API로 폴백...")
+        candles = collect_prices_kis(conn, kis_client, target_days=260)
+        print(f"[주가 수집] KIS API 완료: {candles}개 캔들 저장")
+
+    if candles == 0:
+        print("[주가 수집] 데이터를 수집하지 못했습니다.")
 
     # 통계
     cursor = conn.cursor()
