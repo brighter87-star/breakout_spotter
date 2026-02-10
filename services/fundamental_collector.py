@@ -4,7 +4,6 @@ bs_financials, bs_earnings 테이블에 데이터 저장.
 상장폐지 종목 수집 지원.
 """
 
-import time
 import requests
 import pymysql
 
@@ -149,8 +148,6 @@ def _collect_income_statements(conn, api_key, stocks):
         if i % 50 == 0:
             conn.commit()
 
-        time.sleep(0.08)
-
     conn.commit()
     if error_count > 10:
         print(f"  [WARN] 총 {error_count}개 에러")
@@ -221,8 +218,6 @@ def _collect_earnings(conn, api_key, stocks):
 
         if i % 50 == 0:
             conn.commit()
-
-        time.sleep(0.08)
 
     conn.commit()
     if error_count > 10:

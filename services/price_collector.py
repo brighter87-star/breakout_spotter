@@ -3,7 +3,6 @@
 bs_daily_prices 테이블에 OHLCV 데이터 저장.
 """
 
-import time
 import pymysql
 import requests
 from datetime import datetime, timedelta
@@ -314,8 +313,6 @@ def collect_prices_fmp(conn, api_key, start_date, include_delisted=False):
 
         if i % 50 == 0:
             conn.commit()
-
-        time.sleep(0.08)
 
     conn.commit()
     if error_count > 10:
