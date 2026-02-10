@@ -6,6 +6,7 @@ bs_daily_prices 테이블에 OHLCV 데이터 저장.
 import pymysql
 import requests
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 FMP_BASE = "https://financialmodelingprep.com"
 
@@ -244,77 +245,93 @@ def collect_prices_kis(conn, kis_client, target_days=260):
     return total_candles
 
 
+def _fetch_prices_one(api_key, ticker, req_from):
+    """단일 종목 주가 HTTP 요청 (스레드용)"""
+    try:
+        params = {"symbol": ticker, "from": req_from, "apikey": api_key}
+        resp = requests.get(
+            f"{FMP_BASE}/stable/historical-price-eod/full",
+            params=params, timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data and isinstance(data, list):
+            return data
+        return None
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return None
+        raise
+    except Exception:
+        raise
+
+
 def collect_prices_fmp(conn, api_key, start_date, include_delisted=False):
-    """FMP API로 전 종목 주가 수집 (split-adjusted)"""
+    """FMP API로 전 종목 주가 수집 (split-adjusted, 멀티스레드)"""
     stocks = _get_all_stocks(conn, include_delisted=include_delisted)
     if not stocks:
         print("  bs_stocks에 종목이 없습니다.")
         return 0
 
+    # 종목별 시작일 미리 계산
+    stock_from = {}
+    for s in stocks:
+        latest = _get_latest_date(conn, s["id"])
+        stock_from[s["id"]] = str(latest) if latest and str(latest) > start_date else start_date
+
     total_candles = 0
     total = len(stocks)
     error_count = 0
+    BATCH = 50
+    WORKERS = 15
 
-    for i, s in enumerate(stocks):
-        ticker = s["ticker"]
-        stock_id = s["id"]
-        latest = _get_latest_date(conn, stock_id)
+    for batch_start in range(0, total, BATCH):
+        batch = stocks[batch_start:batch_start + BATCH]
+        print(f"  진행: {batch_start}/{total} (누적 {total_candles}개 캔들, 에러 {error_count}개)", flush=True)
 
-        if i % 50 == 0:
-            print(f"  진행: {i}/{total} (누적 {total_candles}개 캔들, 에러 {error_count}개)", flush=True)
+        with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+            futures = {
+                executor.submit(
+                    _fetch_prices_one, api_key, s["ticker"], stock_from[s["id"]]
+                ): s
+                for s in batch
+            }
+            for future in as_completed(futures):
+                s = futures[future]
+                try:
+                    data = future.result()
+                except Exception as e:
+                    error_count += 1
+                    if error_count <= 10:
+                        print(f"  [ERR] {s['ticker']}: {e}")
+                    continue
 
-        # 시작일 결정: 기존 데이터가 있으면 그 이후부터
-        req_from = str(latest) if latest and str(latest) > start_date else start_date
+                if not data:
+                    continue
 
-        try:
-            params = {"symbol": ticker, "from": req_from}
-            params["apikey"] = api_key
-            resp = requests.get(
-                f"{FMP_BASE}/stable/historical-price-eod/full",
-                params=params, timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
-                pass
-            else:
-                error_count += 1
-                if error_count <= 10:
-                    print(f"  [ERR] {ticker}: {e}")
-            continue
-        except Exception as e:
-            error_count += 1
-            if error_count <= 10:
-                print(f"  [ERR] {ticker}: {e}")
-            continue
+                prices = []
+                for rec in data:
+                    trade_date = rec.get("date")
+                    if not trade_date:
+                        continue
+                    close = rec.get("close") or 0
+                    prices.append({
+                        "date": trade_date,
+                        "open": round(float(rec.get("open") or 0), 4),
+                        "high": round(float(rec.get("high") or 0), 4),
+                        "low": round(float(rec.get("low") or 0), 4),
+                        "close": round(float(close), 4),
+                        "volume": int(rec.get("volume") or 0),
+                    })
 
-        if not data or not isinstance(data, list):
-            continue
+                if prices:
+                    latest = stock_from[s["id"]]
+                    after = latest if latest > start_date else None
+                    inserted = _insert_prices(conn, s["id"], prices, after_date=after)
+                    total_candles += inserted
 
-        prices = []
-        for rec in data:
-            trade_date = rec.get("date")
-            if not trade_date:
-                continue
-            close = rec.get("close") or 0
-            prices.append({
-                "date": trade_date,
-                "open": round(float(rec.get("open") or 0), 4),
-                "high": round(float(rec.get("high") or 0), 4),
-                "low": round(float(rec.get("low") or 0), 4),
-                "close": round(float(close), 4),
-                "volume": int(rec.get("volume") or 0),
-            })
+        conn.commit()
 
-        if prices:
-            inserted = _insert_prices(conn, stock_id, prices, after_date=latest)
-            total_candles += inserted
-
-        if i % 50 == 0:
-            conn.commit()
-
-    conn.commit()
     if error_count > 10:
         print(f"  [WARN] 총 {error_count}개 에러")
     return total_candles

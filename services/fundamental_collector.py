@@ -6,6 +6,7 @@ bs_financials, bs_earnings 테이블에 데이터 저장.
 
 import requests
 import pymysql
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 FMP_BASE = "https://financialmodelingprep.com"
 
@@ -114,41 +115,55 @@ def _insert_financials(conn, stock_id, records):
     return count
 
 
+def _fetch_one(endpoint, api_key, params, stock):
+    """단일 종목 HTTP 요청 (스레드용). (stock, data_or_None, error_or_None) 반환"""
+    try:
+        data = _fmp_get(endpoint, api_key, params)
+        if data and isinstance(data, list):
+            return (stock, data, None)
+        return (stock, None, None)
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return (stock, None, None)
+        return (stock, None, e)
+    except Exception as e:
+        return (stock, None, e)
+
+
 def _collect_income_statements(conn, api_key, stocks):
-    """전 종목 연간 income statement 수집"""
+    """전 종목 연간 income statement 수집 (멀티스레드)"""
     print("[재무 수집] Income Statement 시작...")
     total = len(stocks)
     total_inserted = 0
     error_count = 0
+    BATCH = 50
+    WORKERS = 15
 
-    for i, s in enumerate(stocks):
-        ticker = s["ticker"]
-        stock_id = s["id"]
+    for batch_start in range(0, total, BATCH):
+        batch = stocks[batch_start:batch_start + BATCH]
+        print(f"  진행: {batch_start}/{total} (누적 {total_inserted}개, 에러 {error_count}개)", flush=True)
 
-        if i % 50 == 0:
-            print(f"  진행: {i}/{total} (누적 {total_inserted}개, 에러 {error_count}개)", flush=True)
+        # 병렬 HTTP 요청
+        with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+            futures = [
+                executor.submit(
+                    _fetch_one, "/stable/income-statement", api_key,
+                    {"symbol": s["ticker"], "period": "annual", "limit": 30}, s
+                )
+                for s in batch
+            ]
+            for future in as_completed(futures):
+                stock, data, err = future.result()
+                if err:
+                    error_count += 1
+                    if error_count <= 10:
+                        print(f"  [ERR] {stock['ticker']}: {err}")
+                elif data:
+                    inserted = _insert_financials(conn, stock["id"], data)
+                    total_inserted += inserted
 
-        try:
-            data = _fmp_get("/stable/income-statement", api_key, {"symbol": ticker, "period": "annual", "limit": 30})
-            if data and isinstance(data, list):
-                inserted = _insert_financials(conn, stock_id, data)
-                total_inserted += inserted
-        except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
-                pass
-            else:
-                error_count += 1
-                if error_count <= 10:
-                    print(f"  [ERR] {ticker}: {e}")
-        except Exception as e:
-            error_count += 1
-            if error_count <= 10:
-                print(f"  [ERR] {ticker}: {e}")
+        conn.commit()
 
-        if i % 50 == 0:
-            conn.commit()
-
-    conn.commit()
     if error_count > 10:
         print(f"  [WARN] 총 {error_count}개 에러")
     print(f"[재무 수집] Income Statement 완료: +{total_inserted}개")
@@ -186,40 +201,38 @@ def _insert_earnings(conn, stock_id, records):
 
 
 def _collect_earnings(conn, api_key, stocks):
-    """전 종목 earnings 데이터 수집"""
+    """전 종목 earnings 데이터 수집 (멀티스레드)"""
     print("[재무 수집] Earnings 시작...")
     total = len(stocks)
     total_inserted = 0
     error_count = 0
+    BATCH = 50
+    WORKERS = 15
 
-    for i, s in enumerate(stocks):
-        ticker = s["ticker"]
-        stock_id = s["id"]
+    for batch_start in range(0, total, BATCH):
+        batch = stocks[batch_start:batch_start + BATCH]
+        print(f"  진행: {batch_start}/{total} (누적 {total_inserted}개, 에러 {error_count}개)", flush=True)
 
-        if i % 50 == 0:
-            print(f"  진행: {i}/{total} (누적 {total_inserted}개, 에러 {error_count}개)", flush=True)
+        with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+            futures = [
+                executor.submit(
+                    _fetch_one, "/stable/earnings", api_key,
+                    {"symbol": s["ticker"], "limit": 100}, s
+                )
+                for s in batch
+            ]
+            for future in as_completed(futures):
+                stock, data, err = future.result()
+                if err:
+                    error_count += 1
+                    if error_count <= 10:
+                        print(f"  [ERR] {stock['ticker']}: {err}")
+                elif data:
+                    inserted = _insert_earnings(conn, stock["id"], data)
+                    total_inserted += inserted
 
-        try:
-            data = _fmp_get("/stable/earnings", api_key, {"symbol": ticker, "limit": 100})
-            if data and isinstance(data, list):
-                inserted = _insert_earnings(conn, stock_id, data)
-                total_inserted += inserted
-        except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
-                pass
-            else:
-                error_count += 1
-                if error_count <= 10:
-                    print(f"  [ERR] {ticker}: {e}")
-        except Exception as e:
-            error_count += 1
-            if error_count <= 10:
-                print(f"  [ERR] {ticker}: {e}")
+        conn.commit()
 
-        if i % 50 == 0:
-            conn.commit()
-
-    conn.commit()
     if error_count > 10:
         print(f"  [WARN] 총 {error_count}개 에러")
     print(f"[재무 수집] Earnings 완료: +{total_inserted}개")
