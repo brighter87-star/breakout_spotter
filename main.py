@@ -8,6 +8,8 @@ Usage:
     python main.py collect-prices --reset  # 기존 데이터 삭제 후 재수집
     python main.py collect-financials      # 재무 데이터 수집 (FMP)
     python main.py collect-financials --include-delisted  # 상장폐지 종목 포함
+    python main.py collect-marketcap       # 역사적 시가총액 수집 (FMP)
+    python main.py collect-marketcap --include-delisted  # 상장폐지 종목 포함
     python main.py sync-themes       # theme_analyzer에서 테마 동기화
     python main.py scan              # 돌파 패턴 스캔
     python main.py backtest          # 백테스트
@@ -77,6 +79,15 @@ def run_collect_financials(include_delisted=False):
         conn.close()
 
 
+def run_collect_marketcap(include_delisted=False):
+    from services.fundamental_collector import collect_market_caps
+    conn = get_connection()
+    try:
+        collect_market_caps(conn, include_delisted=include_delisted)
+    finally:
+        conn.close()
+
+
 def run_sync_themes():
     from services.theme_loader import sync_themes
     conn = get_connection()
@@ -116,6 +127,7 @@ def show_status():
         ("bs_earnings", "어닝"),
         ("bs_themes", "테마"),
         ("bs_stock_themes", "테마-종목 매핑"),
+        ("bs_market_cap", "시가총액"),
         ("bs_breakout_signals", "돌파 신호"),
     ]
 
@@ -188,6 +200,7 @@ def main():
         "collect-symbols": run_collect_symbols,
         "collect-prices": lambda: run_collect_prices(reset="--reset" in flags),
         "collect-financials": lambda: run_collect_financials(include_delisted="--include-delisted" in flags),
+        "collect-marketcap": lambda: run_collect_marketcap(include_delisted="--include-delisted" in flags),
         "sync-themes": run_sync_themes,
         "scan": run_scan,
         "backtest": lambda: run_backtest_cmd(include_delisted="--include-delisted" in flags),

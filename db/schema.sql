@@ -80,6 +80,16 @@ CREATE TABLE IF NOT EXISTS bs_earnings (
     INDEX idx_earnings_date (earnings_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS bs_market_cap (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    stock_id    INT NOT NULL,
+    trade_date  DATE NOT NULL,
+    market_cap  BIGINT NOT NULL,
+    FOREIGN KEY (stock_id) REFERENCES bs_stocks(id),
+    UNIQUE KEY uk_stock_date (stock_id, trade_date),
+    INDEX idx_date (trade_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS bs_breakout_signals (
     id                      INT AUTO_INCREMENT PRIMARY KEY,
     stock_id                INT NOT NULL,

@@ -250,6 +250,92 @@ def _collect_earnings(conn, api_key, stocks):
     return total_inserted
 
 
+# ── Historical Market Cap 수집 ────────────────────────────
+
+def _insert_market_caps(conn, stock_id, records):
+    """historical market cap INSERT"""
+    cursor = conn.cursor()
+    count = 0
+    for rec in records:
+        trade_date = rec.get("date")
+        mcap = rec.get("marketCap")
+        if not trade_date or not mcap:
+            continue
+        try:
+            cursor.execute(
+                """INSERT IGNORE INTO bs_market_cap (stock_id, trade_date, market_cap)
+                   VALUES (%s, %s, %s)""",
+                (stock_id, trade_date, int(mcap)),
+            )
+            count += cursor.rowcount
+        except pymysql.Error:
+            pass
+    return count
+
+
+def _collect_market_caps(conn, api_key, stocks, start_date="2016-01-01"):
+    """전 종목 historical market cap 수집 (멀티스레드)"""
+    print(f"[시총 수집] Historical Market Cap 시작 (from {start_date})...")
+    total = len(stocks)
+    total_inserted = 0
+    error_count = 0
+    BATCH = 50
+    WORKERS = 10
+
+    for batch_start in range(0, total, BATCH):
+        batch = stocks[batch_start:batch_start + BATCH]
+        print(f"  진행: {batch_start}/{total} (누적 {total_inserted}개, 에러 {error_count}개)", flush=True)
+
+        with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+            futures = [
+                executor.submit(
+                    _fetch_one, "/stable/historical-market-capitalization", api_key,
+                    {"symbol": s["ticker"], "from": start_date}, s
+                )
+                for s in batch
+            ]
+            for future in as_completed(futures):
+                stock, data, err = future.result()
+                if err:
+                    error_count += 1
+                    if error_count <= 10:
+                        print(f"  [ERR] {stock['ticker']}: {err}")
+                elif data:
+                    inserted = _insert_market_caps(conn, stock["id"], data)
+                    total_inserted += inserted
+
+        conn.commit()
+        time.sleep(0.5)
+
+    if error_count > 10:
+        print(f"  [WARN] 총 {error_count}개 에러")
+    print(f"[시총 수집] 완료: +{total_inserted}개")
+    return total_inserted
+
+
+def collect_market_caps(conn, include_delisted=False):
+    """Historical market cap 수집 메인 함수"""
+    from config.settings import Settings
+    settings = Settings()
+    api_key = settings.FMP_API_KEY
+
+    if not api_key:
+        print("[시총 수집] FMP_API_KEY가 설정되지 않았습니다.")
+        return
+
+    stocks = _get_all_stocks(conn, include_delisted=include_delisted)
+    print(f"[시총 수집] 대상: {len(stocks)}개 종목")
+
+    _collect_market_caps(conn, api_key, stocks)
+
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(DISTINCT stock_id) FROM bs_market_cap")
+    mcap_stocks = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM bs_market_cap")
+    mcap_rows = cursor.fetchone()[0]
+    print(f"[시총 수집] DB 현황: {mcap_stocks}종목, {mcap_rows:,}행")
+
+
 # ── 메인 함수 ──────────────────────────────────────────────
 
 def collect_financials(conn, include_delisted=False):
