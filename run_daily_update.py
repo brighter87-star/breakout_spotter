@@ -217,7 +217,10 @@ def main():
         print("=" * 50)
         if _needs_ma_update(conn) or backfill:
             from services.ma_calculator import calculate_moving_averages
-            calculate_moving_averages(conn)
+            if backfill:
+                calculate_moving_averages(conn)  # 전체 백필
+            else:
+                calculate_moving_averages(conn, latest_only=True)  # 최신일만 (빠름)
         else:
             print("  MA 이미 최신 → 스킵")
 

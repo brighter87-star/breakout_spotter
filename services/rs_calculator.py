@@ -40,7 +40,6 @@ def calculate_rs(conn, backfill=False):
     for col_name, months in RS_PERIODS.items():
         print(f"[RS] {col_name} ({months}개월) 계산 중...")
 
-        # 각 날짜의 N개월 전 가장 가까운 거래일 찾기
         lookback_dates = pivot.index - pd.DateOffset(months=months)
         prev_prices = np.full_like(pivot.values, np.nan)
 
@@ -51,61 +50,95 @@ def calculate_rs(conn, backfill=False):
                 if row_idx is not None:
                     prev_prices[i] = pivot.values[row_idx]
 
-        # 수익률 계산
         with np.errstate(divide="ignore", invalid="ignore"):
             returns_arr = pivot.values / prev_prices - 1
 
         returns_df = pd.DataFrame(returns_arr, index=pivot.index, columns=pivot.columns)
 
-        # 날짜별 순위 → 백분위 (0~99)
         ranks = returns_df.rank(axis=1, method="average")
         counts = returns_df.count(axis=1)
         percentiles = ranks.sub(1).div(counts.sub(1), axis=0).mul(99).round()
         percentiles = percentiles.clip(0, 99)
         rs_frames[col_name] = percentiles
 
-    # 3) 처리할 날짜 필터링
+    # 3) 처리할 날짜 필터링 (이미 채워진 날짜 스킵)
     if backfill:
-        # 6개월 이후부터 유효
         six_months_after = pivot.index[0] + pd.DateOffset(months=6)
-        target_dates = pivot.index[pivot.index >= six_months_after]
-        print(f"[RS] 백필: {len(target_dates)}일 ({target_dates[0].date()} ~ {target_dates[-1].date()})")
+        all_target = pivot.index[pivot.index >= six_months_after]
+
+        # 이미 RS가 채워진 마지막 날짜 확인 → 이어쓰기
+        cursor.execute("SELECT MAX(trade_date) FROM bs_daily_prices WHERE rs_1m IS NOT NULL")
+        last_filled = cursor.fetchone()[0]
+        if last_filled:
+            last_filled = pd.Timestamp(last_filled)
+            target_dates = all_target[all_target > last_filled]
+            if len(target_dates) == 0:
+                print(f"[RS] 이미 모든 날짜 완료 ({last_filled.date()}까지)")
+                return
+            print(f"[RS] 이어쓰기: {last_filled.date()} 이후 {len(target_dates)}일")
+        else:
+            target_dates = all_target
+            print(f"[RS] 백필: {len(target_dates)}일 ({target_dates[0].date()} ~ {target_dates[-1].date()})")
     else:
         target_dates = pivot.index[-1:]
         print(f"[RS] 최근일: {target_dates[0].date()}")
 
-    # 4) DB 업데이트 (배치)
-    update_sql = """
-        UPDATE bs_daily_prices
-        SET rs_1m = %s, rs_3m = %s, rs_6m = %s
-        WHERE stock_id = %s AND trade_date = %s
-    """
+    # 4) DB 업데이트 — 임시 테이블 + JOIN UPDATE (대량 쓰기 최적화)
     total_dates = len(target_dates)
+
+    # 날짜 청크별 처리 (메모리 절약)
+    CHUNK_DAYS = 50
     update_count = 0
 
-    for i, trade_date in enumerate(target_dates):
+    for chunk_start in range(0, total_dates, CHUNK_DAYS):
+        chunk_dates = target_dates[chunk_start:chunk_start + CHUNK_DAYS]
+
+        # 임시 테이블 생성
+        cursor.execute("DROP TEMPORARY TABLE IF EXISTS _tmp_rs")
+        cursor.execute("""
+            CREATE TEMPORARY TABLE _tmp_rs (
+                stock_id INT NOT NULL,
+                trade_date DATE NOT NULL,
+                rs_1m TINYINT UNSIGNED,
+                rs_3m TINYINT UNSIGNED,
+                rs_6m TINYINT UNSIGNED,
+                PRIMARY KEY (stock_id, trade_date)
+            ) ENGINE=MEMORY
+        """)
+
+        # 임시 테이블에 INSERT
+        insert_sql = "INSERT INTO _tmp_rs (stock_id, trade_date, rs_1m, rs_3m, rs_6m) VALUES (%s, %s, %s, %s, %s)"
         batch = []
-        trade_date_str = trade_date.strftime("%Y-%m-%d")
 
-        for stock_id in pivot.columns:
-            vals = {}
-            for col_name in RS_PERIODS:
-                v = rs_frames[col_name].at[trade_date, stock_id]
-                vals[col_name] = int(v) if pd.notna(v) else None
+        for trade_date in chunk_dates:
+            td_str = trade_date.strftime("%Y-%m-%d")
+            for stock_id in pivot.columns:
+                r1 = rs_frames["rs_1m"].at[trade_date, stock_id]
+                r3 = rs_frames["rs_3m"].at[trade_date, stock_id]
+                r6 = rs_frames["rs_6m"].at[trade_date, stock_id]
 
-            if vals.get("rs_1m") is not None:
-                batch.append((
-                    vals.get("rs_1m"), vals.get("rs_3m"), vals.get("rs_6m"),
-                    int(stock_id), trade_date_str,
-                ))
+                if pd.notna(r1):
+                    batch.append((
+                        int(stock_id), td_str,
+                        int(r1), int(r3) if pd.notna(r3) else None,
+                        int(r6) if pd.notna(r6) else None,
+                    ))
 
         if batch:
-            cursor.executemany(update_sql, batch)
-            update_count += len(batch)
+            cursor.executemany(insert_sql, batch)
 
-        if (i + 1) % 20 == 0 or i + 1 == total_dates:
-            conn.commit()
-            print(f"  진행: {i+1}/{total_dates}일 ({update_count:,}행)", flush=True)
+            # JOIN UPDATE (한번에 업데이트)
+            cursor.execute("""
+                UPDATE bs_daily_prices p
+                JOIN _tmp_rs t ON p.stock_id = t.stock_id AND p.trade_date = t.trade_date
+                SET p.rs_1m = t.rs_1m, p.rs_3m = t.rs_3m, p.rs_6m = t.rs_6m
+            """)
+            update_count += cursor.rowcount
 
-    conn.commit()
+        cursor.execute("DROP TEMPORARY TABLE IF EXISTS _tmp_rs")
+        conn.commit()
+
+        done = min(chunk_start + CHUNK_DAYS, total_dates)
+        print(f"  진행: {done}/{total_dates}일 ({update_count:,}행)", flush=True)
+
     print(f"[RS] 완료: {update_count:,}행 업데이트")
