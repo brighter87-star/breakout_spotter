@@ -10,6 +10,10 @@ Usage:
     python main.py collect-financials --include-delisted  # 상장폐지 종목 포함
     python main.py collect-marketcap       # 역사적 시가총액 수집 (FMP)
     python main.py collect-marketcap --include-delisted  # 상장폐지 종목 포함
+    python main.py calculate-ma           # 이동평균선(MA50/150/200) 계산
+    python main.py calculate-rs           # 상대강도(RS) 계산 (최근일)
+    python main.py calculate-rs --backfill # RS 전체 백필
+    python main.py collect-industry       # FMP에서 industry 수집
     python main.py sync-themes       # theme_analyzer에서 테마 동기화
     python main.py scan              # 돌파 패턴 스캔
     python main.py backtest          # 백테스트
@@ -24,7 +28,7 @@ from db.connection import get_connection
 
 
 def init_db():
-    """bs_* 테이블 생성"""
+    """bs_* 테이블 생성 + 마이그레이션"""
     print("[DB 초기화] 시작...")
     schema_path = Path(__file__).parent / "db" / "schema.sql"
     sql = schema_path.read_text(encoding="utf-8")
@@ -36,6 +40,22 @@ def init_db():
         statement = statement.strip()
         if statement:
             cursor.execute(statement)
+
+    # 마이그레이션
+    migrations = [
+        ("bs_daily_prices", "ma50", "DECIMAL(12,4) DEFAULT NULL"),
+        ("bs_daily_prices", "ma150", "DECIMAL(12,4) DEFAULT NULL"),
+        ("bs_daily_prices", "ma200", "DECIMAL(12,4) DEFAULT NULL"),
+        ("bs_daily_prices", "rs_1m", "TINYINT UNSIGNED DEFAULT NULL"),
+        ("bs_daily_prices", "rs_3m", "TINYINT UNSIGNED DEFAULT NULL"),
+        ("bs_daily_prices", "rs_6m", "TINYINT UNSIGNED DEFAULT NULL"),
+        ("bs_stocks", "industry", "VARCHAR(100) DEFAULT NULL"),
+    ]
+    for table, col, col_def in migrations:
+        try:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
+        except Exception:
+            pass  # 이미 존재
 
     conn.commit()
     conn.close()
@@ -102,6 +122,35 @@ def run_scan():
     conn = get_connection()
     try:
         scan_breakouts(conn)
+    finally:
+        conn.close()
+
+
+def run_calculate_ma():
+    from services.ma_calculator import calculate_moving_averages
+    conn = get_connection()
+    try:
+        calculate_moving_averages(conn)
+    finally:
+        conn.close()
+
+
+def run_calculate_rs(backfill=False):
+    from services.rs_calculator import calculate_rs
+    conn = get_connection()
+    try:
+        calculate_rs(conn, backfill=backfill)
+    finally:
+        conn.close()
+
+
+def run_collect_industry():
+    from run_daily_update import collect_industry
+    from config.settings import Settings
+    settings = Settings()
+    conn = get_connection()
+    try:
+        collect_industry(conn, settings.FMP_API_KEY)
     finally:
         conn.close()
 
@@ -201,6 +250,9 @@ def main():
         "collect-prices": lambda: run_collect_prices(reset="--reset" in flags),
         "collect-financials": lambda: run_collect_financials(include_delisted="--include-delisted" in flags),
         "collect-marketcap": lambda: run_collect_marketcap(include_delisted="--include-delisted" in flags),
+        "calculate-ma": run_calculate_ma,
+        "calculate-rs": lambda: run_calculate_rs(backfill="--backfill" in flags),
+        "collect-industry": run_collect_industry,
         "sync-themes": run_sync_themes,
         "scan": run_scan,
         "backtest": lambda: run_backtest_cmd(include_delisted="--include-delisted" in flags),
@@ -209,6 +261,8 @@ def main():
             run_collect_symbols(),
             run_collect_financials(),
             run_collect_prices(),
+            run_calculate_ma(),
+            run_calculate_rs(),
             run_sync_themes(),
             run_scan(),
         ),
