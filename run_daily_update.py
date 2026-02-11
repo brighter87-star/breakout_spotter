@@ -24,27 +24,45 @@ from config.settings import Settings
 
 
 def migrate(conn):
-    """필요한 컬럼이 없으면 추가"""
+    """필요한 컬럼이 없으면 추가 (테이블별 단일 ALTER TABLE로 합침)"""
     cursor = conn.cursor()
-    migrations = [
-        ("bs_daily_prices", "ma50", "DECIMAL(12,4) DEFAULT NULL"),
-        ("bs_daily_prices", "ma150", "DECIMAL(12,4) DEFAULT NULL"),
-        ("bs_daily_prices", "ma200", "DECIMAL(12,4) DEFAULT NULL"),
-        ("bs_daily_prices", "rs_1m", "TINYINT UNSIGNED DEFAULT NULL"),
-        ("bs_daily_prices", "rs_3m", "TINYINT UNSIGNED DEFAULT NULL"),
-        ("bs_daily_prices", "rs_6m", "TINYINT UNSIGNED DEFAULT NULL"),
-        ("bs_stocks", "industry", "VARCHAR(100) DEFAULT NULL"),
-    ]
-    for table, col, col_def in migrations:
-        try:
-            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
-            print(f"  [마이그레이션] {table}.{col} 추가됨")
-        except pymysql.err.OperationalError as e:
-            if e.args[0] == 1060:  # Duplicate column
-                pass
-            else:
-                raise
-    conn.commit()
+
+    # 기존 컬럼 확인
+    cursor.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'bs_daily_prices'")
+    existing_dp = {r[0] for r in cursor.fetchall()}
+    cursor.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'bs_stocks'")
+    existing_st = {r[0] for r in cursor.fetchall()}
+
+    # bs_daily_prices: 없는 컬럼만 한번에 추가
+    dp_adds = []
+    for col, col_def in [
+        ("ma50", "DECIMAL(12,4) DEFAULT NULL"),
+        ("ma150", "DECIMAL(12,4) DEFAULT NULL"),
+        ("ma200", "DECIMAL(12,4) DEFAULT NULL"),
+        ("rs_1m", "TINYINT UNSIGNED DEFAULT NULL"),
+        ("rs_3m", "TINYINT UNSIGNED DEFAULT NULL"),
+        ("rs_6m", "TINYINT UNSIGNED DEFAULT NULL"),
+    ]:
+        if col not in existing_dp:
+            dp_adds.append(f"ADD COLUMN {col} {col_def}")
+
+    if dp_adds:
+        sql = "ALTER TABLE bs_daily_prices " + ", ".join(dp_adds)
+        print(f"  [마이그레이션] bs_daily_prices에 {len(dp_adds)}개 컬럼 추가 중... (대용량 테이블이라 수분 소요)")
+        cursor.execute(sql)
+        conn.commit()
+        print(f"  [마이그레이션] bs_daily_prices 완료")
+    else:
+        print("  [마이그레이션] bs_daily_prices 컬럼 이미 존재")
+
+    # bs_stocks: industry
+    if "industry" not in existing_st:
+        print("  [마이그레이션] bs_stocks.industry 추가 중...")
+        cursor.execute("ALTER TABLE bs_stocks ADD COLUMN industry VARCHAR(100) DEFAULT NULL")
+        conn.commit()
+        print("  [마이그레이션] bs_stocks.industry 완료")
+    else:
+        print("  [마이그레이션] bs_stocks.industry 이미 존재")
 
 
 def collect_today_prices(conn, api_key):
