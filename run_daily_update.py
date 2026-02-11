@@ -151,6 +151,28 @@ def collect_industry(conn, api_key):
     print(f"[산업 수집] 완료: {update_count}개 종목 industry 업데이트")
 
 
+def _needs_price_update(conn):
+    """최신 주가가 오늘/어제(거래일)인지 확인 → 이미 최신이면 False"""
+    cursor = conn.cursor()
+    cursor.execute("SELECT MAX(trade_date) FROM bs_daily_prices")
+    latest = cursor.fetchone()[0]
+    if not latest:
+        return True
+    from datetime import date
+    days_old = (date.today() - latest).days
+    return days_old > 1  # 주말 고려, 1일 이하면 최신
+
+def _needs_ma_update(conn):
+    """MA가 최신 날짜에 채워져 있는지 확인"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT COUNT(*) FROM bs_daily_prices
+        WHERE trade_date = (SELECT MAX(trade_date) FROM bs_daily_prices)
+          AND ma50 IS NOT NULL
+    """)
+    return cursor.fetchone()[0] == 0
+
+
 def main():
     backfill = "--backfill" in sys.argv
 
@@ -169,12 +191,17 @@ def main():
         print("=" * 50)
         migrate(conn)
 
-        # 2. 주가 수집
+        # 2. 주가 수집 (이미 최신이면 스킵)
         print()
         print("=" * 50)
         print("[2/5] 주가 수집 (FMP)")
         print("=" * 50)
-        collect_today_prices(conn, settings.FMP_API_KEY)
+        if _needs_price_update(conn):
+            collect_today_prices(conn, settings.FMP_API_KEY)
+        else:
+            cursor = conn.cursor()
+            cursor.execute("SELECT MAX(trade_date) FROM bs_daily_prices")
+            print(f"  최신 데이터: {cursor.fetchone()[0]} → 스킵")
 
         # 3. industry 수집
         print()
@@ -183,13 +210,16 @@ def main():
         print("=" * 50)
         collect_industry(conn, settings.FMP_API_KEY)
 
-        # 4. MA 계산
+        # 4. MA 계산 (이미 최신이면 스킵)
         print()
         print("=" * 50)
         print("[4/5] 이동평균선 계산 (MA50/150/200)")
         print("=" * 50)
-        from services.ma_calculator import calculate_moving_averages
-        calculate_moving_averages(conn)
+        if _needs_ma_update(conn) or backfill:
+            from services.ma_calculator import calculate_moving_averages
+            calculate_moving_averages(conn)
+        else:
+            print("  MA 이미 최신 → 스킵")
 
         # 5. RS 계산
         print()
