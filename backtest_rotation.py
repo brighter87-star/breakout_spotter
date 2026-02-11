@@ -55,8 +55,8 @@ def load_data():
     print(f"  -> {len(all_prices)} stocks, {total_candles:,} candles ({t1-t0:.0f}s)")
 
     print("[2/2] Loading stocks...", flush=True)
-    cur.execute("SELECT id, ticker, name, industry FROM bs_stocks ORDER BY id")
-    stocks = {r[0]: {"ticker": r[1], "name": r[2], "industry": r[3]} for r in cur.fetchall()}
+    cur.execute("SELECT id, ticker, name, industry, market_cap FROM bs_stocks ORDER BY id")
+    stocks = {r[0]: {"ticker": r[1], "name": r[2], "industry": r[3], "market_cap": r[4]} for r in cur.fetchall()}
 
     conn.close()
 
@@ -81,7 +81,8 @@ def load_data():
     return {"stocks": stocks, "bt_args_base": bt_args_base}
 
 
-def run_industry_rotation(data, rs_period="1m", threshold=70, alloc=None):
+def run_industry_rotation(data, rs_period="1m", threshold=70, alloc=None,
+                          mcap_min=0):
     """
     Industry rotation backtest — 다중 산업 배분.
 
@@ -89,6 +90,7 @@ def run_industry_rotation(data, rs_period="1m", threshold=70, alloc=None):
     상위 산업별로 alloc 만큼 종목을 보유.
     기본: 1위 산업 3종목, 2위 2종목, 3위 1종목 = 총 6 포지션.
     상위 산업 구성이 바뀌면 전량 매도 후 재배분.
+    mcap_min: 시가총액 하한 (0이면 필터 없음)
     """
     if alloc is None:
         alloc = [3, 2, 1]
@@ -100,15 +102,23 @@ def run_industry_rotation(data, rs_period="1m", threshold=70, alloc=None):
     bt_args = data["bt_args_base"]
     rs_col = RS_MAP[rs_period]
 
-    # Filter to stocks with industry
+    # Filter to stocks with industry (+ market cap)
     eligible = []
+    mcap_filtered = 0
     for stock_id, prices, start_idx in bt_args:
         info = stocks_info.get(stock_id, {})
         industry = info.get("industry")
         if not industry:
             continue
+        if mcap_min > 0:
+            mcap = info.get("market_cap")
+            if mcap is None or mcap < mcap_min:
+                mcap_filtered += 1
+                continue
         eligible.append((stock_id, industry, prices, start_idx))
 
+    if mcap_min > 0:
+        print(f"  Market cap filter: >= ${mcap_min/1e9:.0f}B (excluded {mcap_filtered})")
     print(f"  Eligible stocks with industry: {len(eligible)}")
     if not eligible:
         print("  No stocks with industry data!")
@@ -142,7 +152,9 @@ def run_industry_rotation(data, rs_period="1m", threshold=70, alloc=None):
     n_dates = len(dates)
 
     alloc_str = "+".join(str(a) for a in alloc)
+    mcap_str = f"MCap >= ${mcap_min/1e9:.0f}B" if mcap_min > 0 else "MCap: no filter"
     print(f"  Alloc: {alloc_str} = {total_positions} positions across {n_slots} industries")
+    print(f"  {mcap_str}")
     print(f"  Running rotation...", flush=True)
 
     for di, dt in enumerate(dates):
@@ -294,7 +306,7 @@ def run_industry_rotation(data, rs_period="1m", threshold=70, alloc=None):
     # ---- 결과 출력 ----
     print(f"\n{'='*110}")
     print(f"  INDUSTRY ROTATION BACKTEST")
-    print(f"  RS: {rs_period.upper()} >= {threshold},  Alloc: {alloc_str} ({total_positions} positions)")
+    print(f"  RS: {rs_period.upper()} >= {threshold},  Alloc: {alloc_str} ({total_positions} positions),  {mcap_str}")
     print(f"  Period: {dates[0]} ~ {dates[-1]} ({n_years:.1f} years)")
     print(f"{'='*110}")
     print(f"  Initial:      ${INITIAL_CAPITAL:>12,.0f}")
@@ -404,7 +416,8 @@ def main():
     print()
 
     data = load_data()
-    run_industry_rotation(data, rs_period="1m", threshold=70, alloc=[3, 2, 1])
+    run_industry_rotation(data, rs_period="1m", threshold=70, alloc=[3, 2, 1],
+                          mcap_min=10_000_000_000)
 
 
 if __name__ == "__main__":
