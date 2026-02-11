@@ -29,14 +29,7 @@ import pymysql
 from collections import defaultdict
 from multiprocessing import Pool, cpu_count
 import time as time_mod
-
-DB_CONFIG = {
-    "host": "localhost",
-    "port": 3307,
-    "user": "brighter87",
-    "password": "!Wjd06Gns30",
-    "database": "asset_us",
-}
+from db.connection import get_connection
 
 # -- 매수 파라미터 --
 WEEK52_DAYS = 252
@@ -461,7 +454,7 @@ def run_backtest_for_rs(all_prices, stocks, bt_args_base, rs_col_idx, rs_label,
 
 
 def main():
-    conn = pymysql.connect(**DB_CONFIG)
+    conn = get_connection()
     cur = conn.cursor()
     t0 = time_mod.time()
 
