@@ -19,6 +19,8 @@ Usage:
     python main.py backtest          # 백테스트
     python main.py backtest --include-delisted  # 생존편향 제거 백테스트
     python main.py backtest-minervini         # 미너비니 트렌드 템플릿 백테스트
+    python main.py backtest-rotation          # 산업 로테이션 백테스트
+    python main.py backtest-breakout          # 차트 돌파 백테스트 (주가 범위별)
     python main.py full              # 위 전체 순차 실행
     python main.py status            # DB 현황 조회
 """
@@ -170,6 +172,16 @@ def run_backtest_minervini():
     minervini_main()
 
 
+def run_backtest_rotation():
+    from backtest_rotation import main as rotation_main
+    rotation_main()
+
+
+def run_backtest_breakout():
+    from backtest_breakout import main as breakout_main
+    breakout_main()
+
+
 def show_status():
     """DB 현황 조회"""
     conn = get_connection()
@@ -263,6 +275,8 @@ def main():
         "scan": run_scan,
         "backtest": lambda: run_backtest_cmd(include_delisted="--include-delisted" in flags),
         "backtest-minervini": run_backtest_minervini,
+        "backtest-rotation": run_backtest_rotation,
+        "backtest-breakout": run_backtest_breakout,
         "status": show_status,
         "full": lambda: (
             run_collect_symbols(),
