@@ -29,7 +29,6 @@
 
 import pymysql
 from collections import defaultdict
-from multiprocessing import Pool, cpu_count
 import time as time_mod
 from db.connection import get_connection
 
@@ -353,16 +352,13 @@ def _bucket_by_mcap(trades):
 def run_backtest_for_rs(stocks, bt_args_base, rs_col_idx, rs_label,
                         earnings_map, mcap_map, has_mcap_data):
     """특정 RS 기간으로 백테스트 실행 + 결과 출력."""
-    bt_args = [(sid, prices, start_idx, rs_col_idx)
-               for sid, prices, start_idx in bt_args_base]
-
-    num_workers = max(1, cpu_count() - 1)
-
     all_trades = []
-    with Pool(num_workers) as pool:
-        results = pool.map(backtest_stock, bt_args, chunksize=50)
-        for trades in results:
-            all_trades.extend(trades)
+    total = len(bt_args_base)
+    for i, (sid, prices, start_idx) in enumerate(bt_args_base):
+        trades = backtest_stock((sid, prices, start_idx, rs_col_idx))
+        all_trades.extend(trades)
+        if (i + 1) % 1000 == 0:
+            print(f"  진행: {i+1}/{total} ({len(all_trades)} trades)", flush=True)
 
     if not all_trades:
         print(f"\n  [{rs_label}] No trades found.")
