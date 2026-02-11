@@ -18,6 +18,7 @@ Usage:
     python main.py scan              # 돌파 패턴 스캔
     python main.py backtest          # 백테스트
     python main.py backtest --include-delisted  # 생존편향 제거 백테스트
+    python main.py backtest-minervini         # 미너비니 트렌드 템플릿 백테스트
     python main.py full              # 위 전체 순차 실행
     python main.py status            # DB 현황 조회
 """
@@ -164,6 +165,11 @@ def run_backtest_cmd(include_delisted=False):
         conn.close()
 
 
+def run_backtest_minervini():
+    from backtest_minervini import main as minervini_main
+    minervini_main()
+
+
 def show_status():
     """DB 현황 조회"""
     conn = get_connection()
@@ -256,6 +262,7 @@ def main():
         "sync-themes": run_sync_themes,
         "scan": run_scan,
         "backtest": lambda: run_backtest_cmd(include_delisted="--include-delisted" in flags),
+        "backtest-minervini": run_backtest_minervini,
         "status": show_status,
         "full": lambda: (
             run_collect_symbols(),
