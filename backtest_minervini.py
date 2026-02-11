@@ -23,6 +23,8 @@
 - 매수 시점 시가총액 $1B 이상 (bs_market_cap 데이터)
 
 기간: DB 내 최대 기간 (2016~ 현재)
+
+인터랙티브 모드: 데이터 1회 로드 후 파라미터 변경하며 반복 테스트 가능.
 """
 
 import pymysql
@@ -30,24 +32,6 @@ from collections import defaultdict
 from multiprocessing import Pool, cpu_count
 import time as time_mod
 from db.connection import get_connection
-
-# -- 매수 파라미터 --
-WEEK52_DAYS = 252
-MA200_TREND_DAYS = 20       # MA200 상승 추세 확인 기간
-BREAKOUT_LOOKBACK = 60      # 3개월 고가 돌파 기준
-VOLUME_AVG_DAYS = 20        # 거래량 평균 기간
-VOLUME_RATIO_MIN = 2.0      # 돌파일 거래량 배수
-RS_THRESHOLD = 70           # RS 최소값
-
-# -- 매도 파라미터 --
-STOP_LOSS_PCT = 7.0
-TRAILING_STOP_PCT = 20.0
-
-# -- 시가총액 필터 --
-MCAP_MIN = 1_000_000_000   # $1B
-
-# -- 백테스트 기간 --
-BT_START = "2016-01-01"
 
 # 튜플 인덱스
 IDX_DATE = 0
@@ -63,12 +47,32 @@ IDX_RS1M = 9
 IDX_RS3M = 10
 IDX_RS6M = 11
 
-# 시작 전 필요한 최소 데이터 수 (52주 + 여유)
+WEEK52_DAYS = 252
 MIN_HISTORY = WEEK52_DAYS + 10
+
+# 변경 가능한 파라미터 (모듈 레벨 — multiprocessing fork 시 자식에게 복사됨)
+_cfg = {
+    "rs_threshold": 70,
+    "volume_ratio_min": 2.0,
+    "breakout_lookback": 60,
+    "volume_avg_days": 20,
+    "stop_loss_pct": 7.0,
+    "trailing_stop_pct": 20.0,
+    "ma200_trend_days": 20,
+    "mcap_min": 1_000_000_000,
+}
+
+BT_START = "2016-01-01"
+
+RS_MAP = {
+    "1m": IDX_RS1M,
+    "3m": IDX_RS3M,
+    "6m": IDX_RS6M,
+}
 
 
 def check_minervini_template(prices, idx, rs_col_idx):
-    """미너비니 트렌드 템플릿 8가지 조건 확인. True = 후보 종목."""
+    """미너비니 트렌드 템플릿 8가지 조건 확인."""
     if idx < MIN_HISTORY:
         return False
 
@@ -79,7 +83,6 @@ def check_minervini_template(prices, idx, rs_col_idx):
     ma200 = p[IDX_MA200]
     rs_val = p[rs_col_idx]
 
-    # MA/RS 데이터 있어야 함
     if ma50 is None or ma150 is None or ma200 is None or rs_val is None:
         return False
 
@@ -96,10 +99,11 @@ def check_minervini_template(prices, idx, rs_col_idx):
     if ma150 <= ma200:
         return False
 
-    # 3. MA200 상승 추세 (20거래일 전 대비)
-    if idx < MA200_TREND_DAYS:
+    # 3. MA200 상승 추세
+    trend_days = _cfg["ma200_trend_days"]
+    if idx < trend_days:
         return False
-    ma200_prev = prices[idx - MA200_TREND_DAYS][IDX_MA200]
+    ma200_prev = prices[idx - trend_days][IDX_MA200]
     if ma200_prev is None or ma200 <= float(ma200_prev):
         return False
 
@@ -122,16 +126,19 @@ def check_minervini_template(prices, idx, rs_col_idx):
     if close < week52_high * 0.75:
         return False
 
-    # 8. RS >= 70
-    if rs_val < RS_THRESHOLD:
+    # 8. RS >= threshold
+    if rs_val < _cfg["rs_threshold"]:
         return False
 
     return True
 
 
 def check_buy_trigger(prices, idx):
-    """매수 타이밍 확인: 3개월 고가 돌파 + 거래량 2배."""
-    if idx < BREAKOUT_LOOKBACK:
+    """매수 타이밍: 고가 돌파 + 거래량 배수."""
+    lookback = _cfg["breakout_lookback"]
+    vol_days = _cfg["volume_avg_days"]
+
+    if idx < lookback or idx < vol_days:
         return False
 
     close = float(prices[idx][IDX_CLOSE])
@@ -140,32 +147,31 @@ def check_buy_trigger(prices, idx):
         return False
     today_vol = int(today_vol)
 
-    # 3개월 고가 돌파 (직전 60거래일의 고가 중 최대)
-    prev_high = max(float(prices[i][IDX_HIGH]) for i in range(idx - BREAKOUT_LOOKBACK, idx))
+    # 고가 돌파
+    prev_high = max(float(prices[i][IDX_HIGH]) for i in range(idx - lookback, idx))
     if close <= prev_high:
         return False
 
-    # 거래량 >= 20거래일 평균 × 2
-    vol_start = idx - VOLUME_AVG_DAYS
-    if vol_start < 0:
-        return False
-    vol_sum = sum(int(prices[i][IDX_VOL] or 0) for i in range(vol_start, idx))
-    avg_vol = vol_sum / VOLUME_AVG_DAYS
-    if avg_vol <= 0 or today_vol < avg_vol * VOLUME_RATIO_MIN:
+    # 거래량 조건
+    vol_sum = sum(int(prices[i][IDX_VOL] or 0) for i in range(idx - vol_days, idx))
+    avg_vol = vol_sum / vol_days
+    if avg_vol <= 0 or today_vol < avg_vol * _cfg["volume_ratio_min"]:
         return False
 
     return True
 
 
 def backtest_stock(args):
-    """단일 종목 백테스트. (stock_id, prices, start_idx, rs_col_idx) → trades[]"""
+    """단일 종목 백테스트."""
     stock_id, prices, start_idx, rs_col_idx = args
     trades = []
     n = len(prices)
     i = start_idx
 
+    sl_pct = _cfg["stop_loss_pct"]
+    trail_pct = _cfg["trailing_stop_pct"]
+
     while i < n:
-        # 진입 조건: 템플릿 + 트리거
         if not check_minervini_template(prices, i, rs_col_idx):
             i += 1
             continue
@@ -173,12 +179,11 @@ def backtest_stock(args):
             i += 1
             continue
 
-        # 진입
         entry_idx = i
         entry_price = float(prices[i][IDX_CLOSE])
         entry_date = str(prices[i][IDX_DATE])
         peak_price = entry_price
-        stop_price = entry_price * (1 - STOP_LOSS_PCT / 100)
+        stop_price = entry_price * (1 - sl_pct / 100)
 
         exit_price = None
         exit_date = None
@@ -190,7 +195,6 @@ def backtest_stock(args):
             if close > peak_price:
                 peak_price = close
 
-            # 1) 손절: 진입가 -7%
             if close <= stop_price:
                 exit_price = close
                 exit_date = str(prices[j][IDX_DATE])
@@ -198,15 +202,13 @@ def backtest_stock(args):
                 i = j + 1
                 break
 
-            # 2) 트레일링: 고점 -20%
-            if close <= peak_price * (1 - TRAILING_STOP_PCT / 100):
+            if close <= peak_price * (1 - trail_pct / 100):
                 exit_price = close
                 exit_date = str(prices[j][IDX_DATE])
                 exit_reason = "trailing_stop"
                 i = j + 1
                 break
         else:
-            # 미청산
             exit_price = float(prices[-1][IDX_CLOSE])
             exit_date = str(prices[-1][IDX_DATE])
             exit_reason = "open"
@@ -230,11 +232,11 @@ def backtest_stock(args):
 
 
 # =====================================================================
-# 실적 분류 (backtest_custom.py 로직 재사용)
+# 실적 분류
 # =====================================================================
 
 def classify_earnings(stock_id, signal_date, earnings_map):
-    """시그널 날짜 기준 실적 분류. 1=Growth, 2=4Q Loss, 0=미분류"""
+    """1=Growth, 2=4Q Loss, 0=미분류"""
     records = earnings_map.get(stock_id, [])
     if not records:
         return 0
@@ -243,12 +245,10 @@ def classify_earnings(stock_id, signal_date, earnings_map):
     if len(past) < 5:
         return 0
 
-    # 그룹 2: 4분기 연속 적자
     last_4 = past[-4:]
     if all(r[1] is not None and r[1] < 0 for r in last_4):
         return 2
 
-    # 그룹 1: 매출 YoY +10% AND EPS YoY +10% (둘 다 양수)
     latest = past[-1]
     yoy_match = past[-5]
     latest_eps, latest_rev = latest[1], latest[2]
@@ -258,7 +258,6 @@ def classify_earnings(stock_id, signal_date, earnings_map):
         latest_rev is not None and yoy_rev is not None and
         latest_eps > 0 and yoy_eps > 0 and
         latest_rev > 0 and yoy_rev > 0):
-
         eps_growth = (latest_eps / yoy_eps - 1) * 100
         rev_growth = (latest_rev / yoy_rev - 1) * 100
         if eps_growth >= 10 and rev_growth >= 10:
@@ -268,7 +267,6 @@ def classify_earnings(stock_id, signal_date, earnings_map):
 
 
 def lookup_mcap(mcap_dates, mcap_values, entry_date_str):
-    """이진 탐색으로 entry_date 이전 가장 가까운 시가총액 조회."""
     if not mcap_dates:
         return None
     lo, hi = 0, len(mcap_dates) - 1
@@ -284,7 +282,7 @@ def lookup_mcap(mcap_dates, mcap_values, entry_date_str):
 
 
 # =====================================================================
-# 통계 계산
+# 통계 + 출력
 # =====================================================================
 
 MCAP_RANGES = [
@@ -298,7 +296,6 @@ MCAP_RANGES = [
 
 
 def _calc_stats(trades_list):
-    """거래 리스트 → 통계 dict"""
     closed = [t for t in trades_list if t["exit_reason"] != "open"]
     if not closed:
         return None
@@ -322,21 +319,12 @@ def _calc_stats(trades_list):
     median_hold = sorted(t["hold_days"] for t in closed)[n // 2]
 
     return {
-        "total": len(trades_list),
-        "closed": n,
-        "open": len(trades_list) - n,
-        "wins": len(winners),
-        "losses": len(losers),
-        "win_rate": win_rate,
-        "avg_ret": avg_ret,
-        "avg_win": avg_win,
-        "avg_loss": avg_loss,
-        "pl_ratio": pl_ratio,
-        "max_win": max_win,
-        "max_loss": max_loss,
-        "ev": ev,
-        "avg_hold": avg_hold,
-        "median_hold": median_hold,
+        "total": len(trades_list), "closed": n, "open": len(trades_list) - n,
+        "wins": len(winners), "losses": len(losers),
+        "win_rate": win_rate, "avg_ret": avg_ret,
+        "avg_win": avg_win, "avg_loss": avg_loss,
+        "pl_ratio": pl_ratio, "max_win": max_win, "max_loss": max_loss,
+        "ev": ev, "avg_hold": avg_hold, "median_hold": median_hold,
     }
 
 
@@ -362,11 +350,9 @@ def _bucket_by_mcap(trades):
     return result
 
 
-def run_backtest_for_rs(all_prices, stocks, bt_args_base, rs_col_idx, rs_label,
+def run_backtest_for_rs(stocks, bt_args_base, rs_col_idx, rs_label,
                         earnings_map, mcap_map, has_mcap_data):
-    """특정 RS 기간으로 백테스트 실행 + 결과 출력. Returns: stats dict"""
-
-    # multiprocessing 인자에 rs_col_idx 추가
+    """특정 RS 기간으로 백테스트 실행 + 결과 출력."""
     bt_args = [(sid, prices, start_idx, rs_col_idx)
                for sid, prices, start_idx in bt_args_base]
 
@@ -383,6 +369,7 @@ def run_backtest_for_rs(all_prices, stocks, bt_args_base, rs_col_idx, rs_label,
         return None
 
     # 시가총액 필터
+    mcap_min = _cfg["mcap_min"]
     filtered_trades = []
     mcap_filtered = 0
 
@@ -392,17 +379,16 @@ def run_backtest_for_rs(all_prices, stocks, bt_args_base, rs_col_idx, rs_label,
         if mcap_data and has_mcap_data:
             mcap = lookup_mcap(mcap_data[0], mcap_data[1], t["entry_date"])
             t["market_cap"] = mcap
-            if mcap is not None and mcap < MCAP_MIN:
+            if mcap is not None and mcap < mcap_min:
                 mcap_filtered += 1
                 continue
         else:
             t["market_cap"] = None
-
         filtered_trades.append(t)
 
     if has_mcap_data and mcap_filtered:
         print(f"  Market cap filter: {len(all_trades)} -> {len(filtered_trades)} "
-              f"(removed {mcap_filtered} < $1B)")
+              f"(removed {mcap_filtered} < ${mcap_min/1e9:.0f}B)")
         all_trades = filtered_trades
 
     # 실적 분류
@@ -412,6 +398,8 @@ def run_backtest_for_rs(all_prices, stocks, bt_args_base, rs_col_idx, rs_label,
     # -- 결과 출력 --
     print(f"\n{'='*110}")
     print(f"  {rs_label}  ({len(all_trades)} trades)")
+    print(f"  Config: RS>={_cfg['rs_threshold']}  Vol>={_cfg['volume_ratio_min']}x  "
+          f"Breakout={_cfg['breakout_lookback']}d  SL={_cfg['stop_loss_pct']}%  Trail={_cfg['trailing_stop_pct']}%")
     print(f"{'='*110}")
 
     all_s = _calc_stats(all_trades)
@@ -423,7 +411,6 @@ def run_backtest_for_rs(all_prices, stocks, bt_args_base, rs_col_idx, rs_label,
     _print_stat_row("Growth", _calc_stats(g1))
     _print_stat_row("4Q Loss", _calc_stats(g2))
 
-    # 시총 구간별
     mcap_buckets = _bucket_by_mcap(all_trades)
     for mcap_label, bucket in mcap_buckets:
         if not bucket:
@@ -437,7 +424,6 @@ def run_backtest_for_rs(all_prices, stocks, bt_args_base, rs_col_idx, rs_label,
             _print_stat_row("Growth", _calc_stats([t for t in bucket if t["earn_group"] == 1]))
             _print_stat_row("4Q Loss", _calc_stats([t for t in bucket if t["earn_group"] == 2]))
 
-    # 최근 거래
     print(f"\n  Recent 20 trades:")
     print(f"  {'Ticker':<7} {'Entry':>10} {'Exit':>10} {'EntryP':>8} {'ExitP':>8} "
           f"{'Ret%':>7} {'Days':>5} {'MCap($B)':>9} {'Reason':<12}")
@@ -453,22 +439,33 @@ def run_backtest_for_rs(all_prices, stocks, bt_args_base, rs_col_idx, rs_label,
     return all_s
 
 
-def main():
+def print_comparison(summary):
+    """비교 요약표"""
+    if not summary:
+        return
+    print(f"\n\n{'='*110}")
+    print(f"  COMPARISON SUMMARY")
+    print(f"{'='*110}")
+    print(f"  {'Label':<30} {'N':>5}  {'Win%':>6}  {'AvgRet':>8}  {'AvgWin':>8}  "
+          f"{'AvgLoss':>8}  {'P/L':>5}  {'EV':>7}  {'MaxWin':>8}  {'MaxLoss':>9}")
+    print(f"  {'-'*108}")
+    for label, s in summary:
+        print(f"  {label:<30} {s['closed']:>5}  {s['win_rate']:>5.1f}%  "
+              f"{s['avg_ret']:>+7.2f}%  {s['avg_win']:>+7.2f}%  {s['avg_loss']:>+7.2f}%  "
+              f"{s['pl_ratio']:>5.2f}  {s['ev']:>+6.2f}%  "
+              f"{s['max_win']:>+7.1f}%  {s['max_loss']:>+8.1f}%")
+
+
+# =====================================================================
+# 데이터 로드
+# =====================================================================
+
+def load_data():
+    """DB에서 모든 데이터를 로드. 1회만 호출."""
     conn = get_connection()
     cur = conn.cursor()
     t0 = time_mod.time()
 
-    print("=" * 110)
-    print("Minervini Trend Template Backtest")
-    print(f"Period: {BT_START} ~ present")
-    print(f"Entry : Trend Template (8 conditions) + 60d high breakout + vol {VOLUME_RATIO_MIN}x")
-    print(f"Exit  : SL -{STOP_LOSS_PCT}% / Trail -{TRAILING_STOP_PCT}%")
-    print(f"Filter: Market cap >= ${MCAP_MIN/1e9:.0f}B at entry")
-    print(f"RS test: 1M / 3M / 6M (>= {RS_THRESHOLD})")
-    print("=" * 110)
-    print()
-
-    # 1. 데이터 로드
     print("[1/4] Loading prices (with MA + RS)...", flush=True)
     cur.execute("""
         SELECT stock_id, trade_date, open_price, high_price, low_price, close_price, volume,
@@ -476,11 +473,9 @@ def main():
         FROM bs_daily_prices
         ORDER BY stock_id, trade_date
     """)
-
     all_prices = defaultdict(list)
     for row in cur:
         all_prices[row[0]].append(row[1:])
-
     t1 = time_mod.time()
     total_candles = sum(len(v) for v in all_prices.values())
     print(f"  -> {len(all_prices)} stocks, {total_candles:,} candles ({t1-t0:.0f}s)")
@@ -492,8 +487,7 @@ def main():
     print("[3/4] Loading earnings...", flush=True)
     cur.execute("""
         SELECT stock_id, earnings_date, eps_actual, revenue_actual
-        FROM bs_earnings
-        WHERE earnings_date >= '2014-01-01'
+        FROM bs_earnings WHERE earnings_date >= '2014-01-01'
         ORDER BY stock_id, earnings_date
     """)
     earnings_map = defaultdict(list)
@@ -504,8 +498,7 @@ def main():
     print("[4/4] Loading historical market cap...", flush=True)
     cur.execute("""
         SELECT stock_id, trade_date, market_cap
-        FROM bs_market_cap
-        ORDER BY stock_id, trade_date
+        FROM bs_market_cap ORDER BY stock_id, trade_date
     """)
     mcap_map = {}
     current_sid = None
@@ -530,10 +523,8 @@ def main():
         print(f"  -> {len(mcap_map)} stocks, {total_mcap_rows:,} rows")
 
     conn.close()
-    t2 = time_mod.time()
-    print(f"\nData loaded in {t2-t0:.0f}s. Running backtests...\n")
 
-    # 백테스트 인자 준비 (종목별 시작 인덱스)
+    # bt_args_base 준비
     bt_args_base = []
     for stock_id, prices in all_prices.items():
         start_idx = -1
@@ -548,9 +539,20 @@ def main():
             continue
         bt_args_base.append((stock_id, prices, start_idx))
 
-    print(f"Eligible stocks: {len(bt_args_base)}")
+    elapsed = time_mod.time() - t0
+    print(f"\nData loaded in {elapsed:.0f}s. Eligible stocks: {len(bt_args_base)}\n")
 
-    # RS 기간별 백테스트
+    return {
+        "stocks": stocks,
+        "bt_args_base": bt_args_base,
+        "earnings_map": earnings_map,
+        "mcap_map": mcap_map,
+        "has_mcap_data": has_mcap_data,
+    }
+
+
+def run_default_tests(data):
+    """기본 3개 RS 기간 테스트."""
     rs_configs = [
         (IDX_RS1M, "RS 1M (rs_1m >= 70)"),
         (IDX_RS3M, "RS 3M (rs_3m >= 70)"),
@@ -565,8 +567,8 @@ def main():
         print(f"{'#'*110}")
 
         stats = run_backtest_for_rs(
-            all_prices, stocks, bt_args_base, rs_col_idx, rs_label,
-            earnings_map, mcap_map, has_mcap_data,
+            data["stocks"], data["bt_args_base"], rs_col_idx, rs_label,
+            data["earnings_map"], data["mcap_map"], data["has_mcap_data"],
         )
         elapsed = time_mod.time() - t_start
         print(f"\n  [{rs_label}] completed in {elapsed:.0f}s")
@@ -574,22 +576,116 @@ def main():
         if stats:
             summary.append((rs_label, stats))
 
-    # 비교 요약
-    if summary:
-        print(f"\n\n{'='*110}")
-        print(f"  COMPARISON SUMMARY")
-        print(f"{'='*110}")
-        print(f"  {'RS Period':<25} {'N':>5}  {'Win%':>6}  {'AvgRet':>8}  {'AvgWin':>8}  "
-              f"{'AvgLoss':>8}  {'P/L':>5}  {'EV':>7}  {'MaxWin':>8}  {'MaxLoss':>9}")
-        print(f"  {'-'*105}")
-        for label, s in summary:
-            print(f"  {label:<25} {s['closed']:>5}  {s['win_rate']:>5.1f}%  "
-                  f"{s['avg_ret']:>+7.2f}%  {s['avg_win']:>+7.2f}%  {s['avg_loss']:>+7.2f}%  "
-                  f"{s['pl_ratio']:>5.2f}  {s['ev']:>+6.2f}%  "
-                  f"{s['max_win']:>+7.1f}%  {s['max_loss']:>+8.1f}%")
+    print_comparison(summary)
+    return summary
 
-    total_time = time_mod.time() - t0
-    print(f"\nTotal time: {total_time:.0f}s")
+
+def interactive_mode(data):
+    """인터랙티브 모드: 파라미터 변경 후 재테스트."""
+    global _cfg
+    all_summary = []
+
+    print(f"\n{'='*110}")
+    print("  INTERACTIVE MODE")
+    print("  데이터가 메모리에 로드되어 있습니다. 파라미터를 변경하며 반복 테스트하세요.")
+    print(f"{'='*110}")
+
+    while True:
+        print(f"\n  현재 설정:")
+        print(f"    rs_threshold    = {_cfg['rs_threshold']}")
+        print(f"    volume_ratio    = {_cfg['volume_ratio_min']}")
+        print(f"    breakout_days   = {_cfg['breakout_lookback']}")
+        print(f"    stop_loss       = {_cfg['stop_loss_pct']}%")
+        print(f"    trailing_stop   = {_cfg['trailing_stop_pct']}%")
+        print(f"    mcap_min        = ${_cfg['mcap_min']/1e9:.0f}B")
+        print()
+        print("  명령어:")
+        print("    set <key> <value>   — 파라미터 변경 (예: set rs_threshold 80)")
+        print("    run <rs_period>     — 테스트 실행 (1m / 3m / 6m / all)")
+        print("    compare             — 지금까지 결과 비교표")
+        print("    clear               — 비교표 초기화")
+        print("    q                   — 종료")
+        print()
+
+        try:
+            cmd = input("  > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if not cmd:
+            continue
+
+        parts = cmd.split()
+        action = parts[0].lower()
+
+        if action == "q" or action == "quit" or action == "exit":
+            break
+
+        elif action == "set" and len(parts) == 3:
+            key = parts[1]
+            val_str = parts[2]
+            if key in _cfg:
+                try:
+                    if isinstance(_cfg[key], float):
+                        _cfg[key] = float(val_str)
+                    elif isinstance(_cfg[key], int):
+                        _cfg[key] = int(val_str)
+                    print(f"    -> {key} = {_cfg[key]}")
+                except ValueError:
+                    print(f"    -> 잘못된 값: {val_str}")
+            else:
+                print(f"    -> 알 수 없는 키: {key}")
+                print(f"       사용 가능: {', '.join(_cfg.keys())}")
+
+        elif action == "run" and len(parts) >= 2:
+            period = parts[1].lower()
+            if period == "all":
+                rs_list = [("1m", IDX_RS1M), ("3m", IDX_RS3M), ("6m", IDX_RS6M)]
+            elif period in RS_MAP:
+                rs_list = [(period, RS_MAP[period])]
+            else:
+                print(f"    -> 잘못된 RS 기간: {period} (1m / 3m / 6m / all)")
+                continue
+
+            for rs_name, rs_col_idx in rs_list:
+                label = (f"RS {rs_name.upper()} "
+                         f"(rs>={_cfg['rs_threshold']} vol>={_cfg['volume_ratio_min']}x "
+                         f"bo={_cfg['breakout_lookback']}d)")
+                t_start = time_mod.time()
+                stats = run_backtest_for_rs(
+                    data["stocks"], data["bt_args_base"], rs_col_idx, label,
+                    data["earnings_map"], data["mcap_map"], data["has_mcap_data"],
+                )
+                elapsed = time_mod.time() - t_start
+                print(f"\n  Completed in {elapsed:.0f}s")
+                if stats:
+                    all_summary.append((label, stats))
+
+        elif action == "compare":
+            print_comparison(all_summary)
+
+        elif action == "clear":
+            all_summary.clear()
+            print("    -> 비교표 초기화됨")
+
+        else:
+            print(f"    -> 알 수 없는 명령: {cmd}")
+
+
+def main():
+    print("=" * 110)
+    print("Minervini Trend Template Backtest")
+    print(f"Period: {BT_START} ~ present")
+    print("=" * 110)
+    print()
+
+    data = load_data()
+
+    # 기본 3개 RS 테스트
+    run_default_tests(data)
+
+    # 인터랙티브 모드
+    interactive_mode(data)
 
 
 if __name__ == "__main__":
